@@ -81,6 +81,15 @@ function makeTree({ slug = "c-users-mechrevo", sessionId = "sess-1", lines = [] 
   return { dir, home, projectDir, filePath };
 }
 
+function readFixtureSnapshot(filePath) {
+  const fd = fs.openSync(filePath, "r");
+  try {
+    return { stat: fs.fstatSync(fd), text: fs.readFileSync(fd, "utf8") };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function makeLegacyCommandCodeTree() {
   const sessionId = "sess-migrate";
   const { dir, filePath } = makeTree({ sessionId });
@@ -978,8 +987,8 @@ test("Command Code migrates a version-1 fork ledger with unchanged fingerprints 
   // a migration must invalidate fingerprints, not discard the old subtraction ledger.
   for (const [sessionId, owner] of [["parent-session", filePath], ["fork-session", childPath]]) {
     const key = `command-code:${sessionId}|abc12345`;
-    const { size, mtimeMs } = fs.statSync(owner);
-    const headerLength = Buffer.byteLength(fs.readFileSync(owner, "utf8").split("\n")[0]);
+    const { stat: { size, mtimeMs }, text } = readFixtureSnapshot(owner);
+    const headerLength = Buffer.byteLength(text.split("\n")[0]);
     messages[key] = {
       totals: { ...LIFECYCLE_TOTALS }, conversationCount: 1, bucketStart: T0,
       model: LIFECYCLE_ROW.model, projectKey: project.project_key, projectRef: project.project_ref,
@@ -1598,8 +1607,7 @@ test("Command Code rebuilds a transcript that changes during its cached header r
 test("Command Code retries an equal-size rewrite between a full read and its final descriptor stat", async () => {
   const { dir, filePath, options } = makeLifecycleTree();
   const originalOpen = fsp.open;
-  const beforeStat = fs.statSync(filePath);
-  const originalText = fs.readFileSync(filePath, "utf8");
+  const { stat: beforeStat, text: originalText } = readFixtureSnapshot(filePath);
   const replacement = originalText.replace(
     messageLine({ id: "m1", costUsd: 0.42 }),
     messageLine({ id: "m2", inputTokens: 2000, outputTokens: 200, costUsd: 0.84 }),
