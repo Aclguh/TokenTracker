@@ -136,6 +136,88 @@ function scopedModules({ home, env = {}, redirect = (file) => file, ioFailure, r
   return { load: (file) => load(path.join(ROOT, file)), env: localEnv };
 }
 
+async function captureStatus(cmdStatus, args) {
+  const previousWrite = process.stdout.write;
+  let output = "";
+  process.stdout.write = (chunk, encoding, callback) => {
+    // node:test binary IPC must pass through rather than becoming status text.
+    if (typeof chunk !== "string") return previousWrite.call(process.stdout, chunk, encoding, callback);
+    output += chunk;
+    if (typeof encoding === "function") encoding();
+    else if (typeof callback === "function") callback();
+    return true;
+  };
+  try { await cmdStatus(args); } finally { process.stdout.write = previousWrite; }
+  return output;
+}
+
+for (const [scenario, code] of [
+  ["root directory", "EACCES"],
+  ["project directory", "EPERM"],
+  ["WSL distro probe", "ETIMEDOUT"],
+  ["WSL identity probe", "EIO"],
+]) {
+  for (const format of ["JSON", "human"]) {
+    test(`Command Code ${format} status preserves other diagnostics after ${scenario} ${code}`, async (t) => {
+      const { home, file } = fixture(t);
+      const clineHome = path.join(home, ".cline");
+      write(path.join(clineHome, "data", "sessions", "healthy", "healthy.messages.json"), '{"version":1,"messages":[]}\n');
+      const queue = path.join(home, ".tokentracker", "tracker", "queue.jsonl");
+      write(queue, JSON.stringify(ROW) + "\n");
+      const pendingBytes = fs.statSync(queue).size;
+      const isWsl = scenario.startsWith("WSL");
+      const failedDirectory = scenario === "root directory"
+        ? path.join(home, ".commandcode", "projects") : path.dirname(file);
+      const injected = Object.assign(new Error(`synthetic Command Code ${scenario}`), { code });
+      let failures = 0;
+      const runtime = scopedModules({
+        home,
+        env: {
+          TOKENTRACKER_CLINE_HOME: clineHome,
+          TOKENTRACKER_WSL_MODE: isWsl ? "wsl-only" : "native-only",
+          ...(!isWsl ? { TOKENTRACKER_COMMANDCODE_HOME: path.join(home, ".commandcode") } : {}),
+        },
+        ioFailure(method, filename) {
+          if (!isWsl && method === "readdir" && filename === failedDirectory) {
+            failures += 1;
+            return injected;
+          }
+          return null;
+        },
+        runWsl(args) {
+          const list = args[0] === "-l";
+          if (scenario === (list ? "WSL distro probe" : "WSL identity probe")) {
+            failures += 1;
+            throw injected;
+          }
+          return Buffer.from(list ? "  NAME STATE VERSION\n* Synthetic Running 2\n" : "fixture\n", list ? "utf16le" : "utf8");
+        },
+      });
+      const { cmdStatus } = runtime.load("src/commands/status.js");
+      const output = await captureStatus(cmdStatus, format === "JSON" ? ["--json"] : []);
+      assert.ok(failures > 0, "the intended discovery failure was exercised");
+      const expectedError = `${code}: ${injected.message}`;
+      if (format === "JSON") {
+        const summary = JSON.parse(output);
+        assert.deepEqual(summary.providers["command-code"], { installed: false, error: expectedError });
+        assert.deepEqual(summary.providers.cline, { installed: true, files: 1 });
+        assert.equal(summary.queue.pending_bytes, pendingBytes);
+        assert.equal(summary.queue.size_bytes, pendingBytes);
+        assert.equal(typeof summary.hooks.claude, "boolean");
+      } else {
+        assert.match(output, /^TokenTracker v/m);
+        assert.ok(output.includes(`- Command Code: discovery failed (${expectedError})`));
+        assert.match(output, /- Cline: passive reader \(1 transcript in 1 sessions dir\)/);
+        assert.ok(output.includes(`- Queue: ${pendingBytes} bytes pending`));
+      }
+      // Only status may downgrade the exception to a diagnostic. Sync still
+      // receives a strict discovery failure, never a successful empty scan.
+      await assert.rejects(runtime.load("src/lib/rollout.js").resolveCommandCodeSessionFiles(), (error) => error === injected);
+      assert.equal(fs.statSync(queue).size, pendingBytes, "status is read-only");
+    });
+  }
+}
+
 for (const [method, target, code] of [
   ["readFile", "config", "EACCES"],
   ["readFile", "config", "EPERM"],
