@@ -123,6 +123,37 @@ test("cmdSync reconciles the last Command Code transcript's deletion and persist
   });
 });
 
+test("Command Code status excludes prompt and checkpoint sidecars from its session count", async () => {
+  await withCommandCodeHome(async ({ projectDir, filePath }) => {
+    for (const name of ["session-one.prompts.jsonl", "session-one.prompts.backup.jsonl", "session-one.checkpoints.jsonl"]) {
+      fs.copyFileSync(filePath, path.join(projectDir, name));
+    }
+    const { cmdStatus } = require("../src/commands/status");
+    const status = async (args) => {
+      const previousWrite = process.stdout.write;
+      let output = "";
+      process.stdout.write = (chunk, encoding, callback) => {
+        // node:test also sends binary IPC frames through stdout; do not consume
+        // those while capturing cmdStatus's text output.
+        if (typeof chunk !== "string") return previousWrite.call(process.stdout, chunk, encoding, callback);
+        output += chunk;
+        if (typeof encoding === "function") encoding();
+        else if (typeof callback === "function") callback();
+        return true;
+      };
+      try { await cmdStatus(args); } finally { process.stdout.write = previousWrite; }
+      return output;
+    };
+    const summary = JSON.parse(await status(["--json"]));
+    assert.equal(summary.providers["command-code"].installed, true);
+    assert.equal(summary.providers["command-code"].files, 1);
+    assert.match(await status([]), /Command Code: passive reader \(1 session in /);
+    fs.unlinkSync(filePath);
+    const onlySidecars = JSON.parse(await status(["--json"]));
+    assert.deepEqual(onlySidecars.providers["command-code"], { installed: false });
+  });
+});
+
 test("cmdSync persists a Command Code project-only update despite the v2 no-op optimization", async () => {
   await withCommandCodeHome(async ({ filePath, repoDir, queuePath, projectQueuePath, sync, readCursors }) => {
     await sync();
@@ -138,7 +169,7 @@ test("cmdSync persists a Command Code project-only update despite the v2 no-op o
     assert.deepEqual(readRows(projectQueuePath), [PROJECT_ROW]);
     assert.deepEqual(fs.readFileSync(queuePath), hourlyBytes);
     assert.equal(refreshed.cursor_commits, 1, "project-only writes must publish the associated ledger");
-    assert.equal((await readCursors()).commandCode.messages["command-code:session-one|record-one"].projectKey,
+    assert.equal((await readCursors()).commandCode.messages[`command-code:record-one|${T0}`].projectKey,
       PROJECT_ROW.project_key);
     const currentStat = fs.statSync(filePath);
     assert.equal(currentStat.size, transcriptStat.size);

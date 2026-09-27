@@ -55,11 +55,16 @@ export const AGENT_LOGOS = [
   },
   {
     id: 40,
+    nameKey: "provider.display.cline",
+    provider: "cline",
+  },
+  {
+    id: 41,
     nameKey: "provider.display.minimax_code",
     provider: "minimax-code",
   },
   {
-    id: 41,
+    id: 42,
     nameKey: "provider.display.command_code",
     provider: "command-code",
   },

@@ -57,7 +57,7 @@ function fixture(t) {
 
 // Each test gets private CommonJS module instances and private built-in
 // dependency facades. No global fs method, require cache or WSL cache is patched.
-function scopedModules({ home, env = {}, redirect = (file) => file, ioFailure, runWsl, onHandle, onOpen } = {}) {
+function scopedModules({ home, env = {}, redirect = (file) => file, ioFailure, runWsl } = {}) {
   const cache = new Map();
   const localEnv = {
     PATH: process.env.PATH || "", SystemRoot: process.env.SystemRoot || "C:\\Windows",
@@ -76,10 +76,8 @@ function scopedModules({ home, env = {}, redirect = (file) => file, ioFailure, r
       const resolved = redirect(file);
       const error = ioFailure?.(method, resolved);
       if (error) throw error;
-      if (method === "open") onOpen?.(resolved, args);
       const value = await fsp[method](resolved, ...args);
       if (method !== "open") return value;
-      onHandle?.(value, resolved);
       for (const operation of ["stat", "readFile", "close"]) {
         const invoke = value[operation].bind(value);
         value[operation] = async (...handleArgs) => {
@@ -129,13 +127,88 @@ function scopedModules({ home, env = {}, redirect = (file) => file, ioFailure, r
     scopedRequire.resolve = localRequire.resolve;
     let source = fs.readFileSync(filename, "utf8");
     if (filename === path.join(ROOT, "src", "lib", "rollout.js")) {
-      source += "\nmodule.exports.projectObservationTest = { resolveGitConfigPath, readGitRemoteUrl, resolveProjectContextForPath };";
+      source += "\nmodule.exports.projectObservationTest = { resolveGitConfigPath, readGitRemoteUrl };";
     }
     const evaluate = new Function("exports", "require", "module", "__filename", "__dirname", "process", source);
     evaluate(module.exports, scopedRequire, module, filename, path.dirname(filename), localProcess);
     return module.exports;
   }
   return { load: (file) => load(path.join(ROOT, file)), env: localEnv };
+}
+
+for (const [method, target, code] of [
+  ["readFile", "config", "EACCES"],
+  ["readFile", "config", "EPERM"],
+  ["stat", "config", "EACCES"],
+  ["stat", "git", "EPERM"],
+  ["readFile", "config", "EIO"],
+]) {
+  for (const scenario of ["fresh", "append"]) {
+    test(`Command Code keeps global and healthy-project usage on ${scenario} Git ${target} ${method} ${code}`, async (t) => {
+      const { home, config, file } = fixture(t);
+      const healthyRepo = path.join(home, "healthy-project");
+      const healthyKey = "acme/healthy-observation";
+      const healthyRef = `https://github.com/${healthyKey}`;
+      const healthyFile = path.join(path.dirname(file), "healthy.jsonl");
+      write(path.join(healthyRepo, ".git", "config"), `[remote "origin"]\n\turl = ${healthyRef}.git\n`);
+      write(healthyFile, `${JSON.stringify({ type: "session", version: 3, id: "healthy", cwd: healthyRepo })}\n${message("n1")}\n`);
+      const injected = Object.assign(new Error("synthetic optional Git metadata failure"), { code });
+      let fail = false;
+      let failures = 0;
+      const runtime = scopedModules({ home, ioFailure(operation, filename) {
+        if (fail && operation === method && filename === (target === "git" ? path.dirname(config) : config)) {
+          failures += 1;
+          return injected;
+        }
+        return null;
+      } });
+      const rollout = runtime.load("src/lib/rollout.js");
+      const options = {
+        // The failing project's file comes last, after healthy new usage.
+        sessionFiles: [healthyFile, file], cursors: {}, queuePath: path.join(home, "queue.jsonl"),
+        projectQueuePath: path.join(home, "project.queue.jsonl"),
+      };
+      if (scenario === "append") {
+        await rollout.parseCommandCodeIncremental(options);
+        fs.appendFileSync(file, message("m2") + "\n");
+        fs.appendFileSync(healthyFile, message("n2") + "\n");
+      }
+      fail = true;
+      const changed = await rollout.parseCommandCodeIncremental(options);
+      assert.ok(failures > 0, "the selected Git metadata operation really failed");
+      assert.equal(changed.bucketsQueued, 1, "optional attribution cannot discard global usage");
+      const sessions = scenario === "append" ? 4 : 2;
+      const expected = {
+        ...TOTALS, input_tokens: 1000 * sessions, output_tokens: 100 * sessions,
+        total_tokens: 1100 * sessions, billable_total_tokens: 1100 * sessions,
+        total_cost_usd: 0.42 * sessions, conversation_count: sessions,
+      };
+      assert.deepEqual(readRows(options.queuePath).at(-1), { ...ROW, ...expected });
+      const projectRows = new Map(readRows(options.projectQueuePath).map((row) => [row.project_key, row]));
+      assert.deepEqual(projectRows.get(healthyKey), {
+        ...PROJECT_ROW, project_key: healthyKey, project_ref: healthyRef,
+        ...(scenario === "append" ? DOUBLE_TOTALS : TOTALS),
+      });
+      assert.equal(projectRows.get(PROJECT_KEY)?.total_tokens || 0, 0, "inaccessible metadata loses only project attribution");
+      assert.equal(options.cursors.commandCode.messages[`command-code:m1|${T0}`].projectKey, null);
+      const hourlyBytes = fs.readFileSync(options.queuePath);
+
+      fail = false;
+      options.cursors = JSON.parse(JSON.stringify(options.cursors));
+      const recovered = await rollout.parseCommandCodeIncremental(options);
+      assert.equal(recovered.recordsProcessed, 0, "unchanged transcript headers can restore attribution");
+      assert.equal(recovered.bucketsQueued, 0);
+      assert.equal(recovered.projectBucketsQueued, 1);
+      assert.deepEqual(fs.readFileSync(options.queuePath), hourlyBytes);
+      assert.deepEqual(readRows(options.projectQueuePath).at(-1), {
+        ...PROJECT_ROW, ...(scenario === "append" ? DOUBLE_TOTALS : TOTALS),
+      });
+      assert.equal(options.cursors.commandCode.messages[`command-code:m1|${T0}`].projectKey, PROJECT_KEY);
+      const repeated = await rollout.parseCommandCodeIncremental(options);
+      assert.equal(repeated.bucketsQueued, 0);
+      assert.equal(repeated.projectBucketsQueued, 0);
+    });
+  }
 }
 
 for (const operation of ["list", "whoami"]) {
@@ -195,54 +268,6 @@ test("strict WSL never probes in native-only mode and does not accept an empty i
   }), { code: "EWSLIDENTITY" });
 });
 
-for (const [method, target, code, failAt] of [
-  ["readFile", "config", "EIO", 1],
-  ["stat", "config", "EACCES", 1],
-  ["stat", "config", "EPERM", 2],
-  ["stat", "git", "EIO", 1],
-]) {
-  test(`Command Code rejects project ${target} ${method} ${code} before queue/cursor publication`, async (t) => {
-    const { home, config, file } = fixture(t);
-    const injected = Object.assign(new Error("synthetic project observation failure"), { code });
-    let fail = false;
-    let calls = 0;
-    const runtime = scopedModules({ home, ioFailure(operation, filename) {
-      if (fail && operation === method && filename === (target === "git" ? path.dirname(config) : config)) {
-        calls += 1;
-        if (calls === failAt) return injected;
-      }
-      return null;
-    } });
-    const rollout = runtime.load("src/lib/rollout.js");
-    const options = {
-      sessionFiles: [file], cursors: {}, queuePath: path.join(home, "queue.jsonl"),
-      projectQueuePath: path.join(home, "project.queue.jsonl"),
-    };
-    await rollout.parseCommandCodeIncremental(options);
-    assert.deepEqual(readRows(options.queuePath), [ROW]);
-    assert.deepEqual(readRows(options.projectQueuePath), [PROJECT_ROW]);
-    const beforeCursor = JSON.stringify(options.cursors);
-    const beforeHourly = fs.readFileSync(options.queuePath);
-    const beforeProject = fs.readFileSync(options.projectQueuePath);
-    const transcriptStat = fs.statSync(file);
-    fail = true;
-    await assert.rejects(rollout.parseCommandCodeIncremental(options), (error) => error === injected);
-    assert.equal(JSON.stringify(options.cursors), beforeCursor);
-    assert.deepEqual(fs.readFileSync(options.queuePath), beforeHourly);
-    assert.deepEqual(fs.readFileSync(options.projectQueuePath), beforeProject);
-    assert.equal(options.cursors.projectHourly.projects[PROJECT_KEY].purge_pending, false);
-    assert.equal(fs.statSync(file).size, transcriptStat.size);
-    assert.equal(fs.statSync(file).mtimeMs, transcriptStat.mtimeMs);
-    fail = false;
-    const recovered = await rollout.parseCommandCodeIncremental(options);
-    assert.equal(recovered.recordsProcessed, 0);
-    assert.equal(recovered.eventsAggregated, 0);
-    assert.deepEqual(fs.readFileSync(options.queuePath), beforeHourly);
-    assert.deepEqual(fs.readFileSync(options.projectQueuePath), beforeProject);
-    assert.equal(options.cursors.commandCode.messages["command-code:session|m1"].projectKey, PROJECT_KEY);
-  });
-}
-
 for (const removed of ["config", "remote"]) {
   test(`Command Code reconciles a successfully observed missing Git ${removed}`, async (t) => {
     const { home, config, file } = fixture(t);
@@ -265,7 +290,7 @@ for (const removed of ["config", "remote"]) {
   });
 }
 
-test("Git helper strict I/O is opt-in and keeps default-provider fallback behavior", async (t) => {
+test("Git helpers keep upstream best-effort fallback behavior", async (t) => {
   const { home, repo, config } = fixture(t);
   const injected = Object.assign(new Error("synthetic helper EIO"), { code: "EIO" });
   let method = "readFile";
@@ -274,13 +299,11 @@ test("Git helper strict I/O is opt-in and keeps default-provider fallback behavi
   } });
   const helpers = runtime.load("src/lib/rollout.js").projectObservationTest;
   assert.equal(await helpers.readGitRemoteUrl(config), null);
-  await assert.rejects(helpers.readGitRemoteUrl(config, { strictIo: true }), (error) => error === injected);
   method = "stat";
   assert.equal(await helpers.resolveGitConfigPath(repo), null);
-  await assert.rejects(helpers.resolveGitConfigPath(repo, { strictIo: true }), (error) => error === injected);
 });
 
-test("Command Code aborts mixed new/old usage on project failure instead of inheriting an old public ref", async (t) => {
+test("Command Code counts mixed new/old usage on project failure without inheriting an old public ref", async (t) => {
   const { home, config, file } = fixture(t);
   let fail = false;
   const injected = Object.assign(new Error("synthetic unverified project"), { code: "EIO" });
@@ -293,22 +316,18 @@ test("Command Code aborts mixed new/old usage on project failure instead of inhe
     projectQueuePath: path.join(home, "project.queue.jsonl"),
   };
   await rollout.parseCommandCodeIncremental(options);
-  const before = JSON.stringify(options.cursors);
-  const hourly = fs.readFileSync(options.queuePath);
-  const project = fs.readFileSync(options.projectQueuePath);
   fs.appendFileSync(file, message("m2") + "\n");
   fs.writeFileSync(config, '[remote "origin"]\n\turl = file:///synthetic-private-repository\n');
   fail = true;
-  await assert.rejects(rollout.parseCommandCodeIncremental(options), (error) => error === injected);
-  assert.equal(JSON.stringify(options.cursors), before);
-  assert.deepEqual(fs.readFileSync(options.queuePath), hourly);
-  assert.deepEqual(fs.readFileSync(options.projectQueuePath), project);
+  await rollout.parseCommandCodeIncremental(options);
+  assert.deepEqual(readRows(options.queuePath), [ROW, { ...ROW, ...DOUBLE_TOTALS }]);
+  assert.deepEqual(readRows(options.projectQueuePath), [PROJECT_ROW, { ...PROJECT_ROW, ...ZERO_TOTALS }]);
   fail = false;
   await rollout.parseCommandCodeIncremental(options);
   assert.deepEqual(readRows(options.queuePath), [ROW, { ...ROW, ...DOUBLE_TOTALS }]);
   assert.deepEqual(readRows(options.projectQueuePath), [PROJECT_ROW, { ...PROJECT_ROW, ...ZERO_TOTALS }]);
-  assert.equal(options.cursors.commandCode.messages["command-code:session|m2"].projectKey, null);
-  assert.notEqual(options.cursors.commandCode.messages["command-code:session|m2"].projectRef, PROJECT_ROW.project_ref);
+  assert.equal(options.cursors.commandCode.messages[`command-code:m2|${T0}`].projectKey, null);
+  assert.notEqual(options.cursors.commandCode.messages[`command-code:m2|${T0}`].projectRef, PROJECT_ROW.project_ref);
 });
 
 for (const operation of ["list", "whoami"]) {
@@ -394,7 +413,7 @@ for (const [method, target, code] of [
   ["stat", "commonConfig", "EIO"],
   ["readFile", "commonConfig", "EPERM"],
 ]) {
-  test(`strict project observation covers worktree ${target} ${method} ${code}`, async (t) => {
+  test(`best-effort project attribution covers worktree ${target} ${method} ${code}`, async (t) => {
     const { home, file } = fixture(t);
     const worktree = path.join(home, "synthetic-worktree");
     const admin = path.join(home, "shared.git", "worktrees", "fixture");
@@ -421,24 +440,24 @@ for (const [method, target, code] of [
     await rollout.parseCommandCodeIncremental(options);
     assert.deepEqual(readRows(options.queuePath), [ROW]);
     assert.deepEqual(readRows(options.projectQueuePath), [PROJECT_ROW]);
-    const cursor = JSON.stringify(options.cursors);
     const hourly = fs.readFileSync(options.queuePath);
-    const project = fs.readFileSync(options.projectQueuePath);
     fail = true;
-    await assert.rejects(rollout.parseCommandCodeIncremental(options), (error) => error === injected);
-    assert.equal(JSON.stringify(options.cursors), cursor);
+    await rollout.parseCommandCodeIncremental(options);
     assert.deepEqual(fs.readFileSync(options.queuePath), hourly);
-    assert.deepEqual(fs.readFileSync(options.projectQueuePath), project);
+    // An unreadable worktree-local config still permits the common config
+    // fallback. Other failed lookups omit only optional attribution.
+    assert.deepEqual(readRows(options.projectQueuePath), target === "worktreeConfig"
+      ? [PROJECT_ROW] : [PROJECT_ROW, { ...PROJECT_ROW, ...ZERO_TOTALS }]);
     fail = false;
     const recovered = await rollout.parseCommandCodeIncremental(options);
     assert.equal(recovered.recordsProcessed, 0);
-    assert.equal(recovered.eventsAggregated, 0);
     assert.deepEqual(fs.readFileSync(options.queuePath), hourly);
-    assert.deepEqual(fs.readFileSync(options.projectQueuePath), project);
+    assert.deepEqual(readRows(options.projectQueuePath).at(-1), PROJECT_ROW);
+    assert.equal((await rollout.parseCommandCodeIncremental(options)).projectBucketsQueued, 0);
   });
 }
 
-test("a later project's observation error prevents publishing an earlier file's new usage", async (t) => {
+test("a later project's metadata failure does not discard an earlier file's new usage", async (t) => {
   const { home, file } = fixture(t);
   const secondRepo = path.join(home, "unverified-repository");
   const secondConfig = path.join(secondRepo, ".git", "config");
@@ -456,17 +475,9 @@ test("a later project's observation error prevents publishing an earlier file's 
     projectQueuePath: path.join(home, "project.queue.jsonl"),
   };
   await rollout.parseCommandCodeIncremental(options);
-  const cursor = JSON.stringify(options.cursors);
-  const hourly = fs.readFileSync(options.queuePath);
-  const project = fs.readFileSync(options.projectQueuePath);
   fs.appendFileSync(file, message("m2") + "\n");
   options.sessionFiles.push(secondFile);
   fail = true;
-  await assert.rejects(rollout.parseCommandCodeIncremental(options), (error) => error === injected);
-  assert.equal(JSON.stringify(options.cursors), cursor);
-  assert.deepEqual(fs.readFileSync(options.queuePath), hourly);
-  assert.deepEqual(fs.readFileSync(options.projectQueuePath), project);
-  fail = false;
   await rollout.parseCommandCodeIncremental(options);
   const total = {
     ...TOTALS, input_tokens: 3000, output_tokens: 300, total_tokens: 3300,
@@ -474,11 +485,13 @@ test("a later project's observation error prevents publishing an earlier file's 
   };
   assert.deepEqual(readRows(options.queuePath), [ROW, { ...ROW, ...total }]);
   assert.deepEqual(readRows(options.projectQueuePath), [PROJECT_ROW, { ...PROJECT_ROW, ...DOUBLE_TOTALS }]);
-  assert.equal(options.cursors.commandCode.messages["command-code:second|n1"].projectKey, null);
+  assert.equal(options.cursors.commandCode.messages[`command-code:n1|${T0}`].projectKey, null);
+  fail = false;
+  assert.equal((await rollout.parseCommandCodeIncremental(options)).bucketsQueued, 0);
 });
 
-test("actual cmdSync preserves v2 core and both queues on Git config EIO, without publishing purge intent", async (t) => {
-  const { home, config } = fixture(t);
+test("actual cmdSync counts appended usage through Git config EIO and restores attribution on restart", async (t) => {
+  const { home, config, file } = fixture(t);
   const injected = Object.assign(new Error("synthetic Git config EIO"), { code: "EIO" });
   let fail = false;
   const runtime = scopedModules({ home, ioFailure(method, filename) {
@@ -493,25 +506,25 @@ test("actual cmdSync preserves v2 core and both queues on Git config EIO, withou
   };
   const queue = path.join(home, ".tokentracker", "tracker", "queue.jsonl");
   const project = path.join(home, ".tokentracker", "tracker", "project.queue.jsonl");
-  const initial = await sync();
+  await sync();
   assert.deepEqual(readRows(queue), [ROW]);
   assert.deepEqual(readRows(project), [PROJECT_ROW]);
-  const core = fs.readFileSync(initial.cursor_path);
-  const hourly = fs.readFileSync(queue);
-  const projectBytes = fs.readFileSync(project);
+  fs.appendFileSync(file, message("m2") + "\n");
   fail = true;
-  const failed = await sync();
-  assert.equal(failed.cursor_commits, 0);
-  assert.deepEqual(fs.readFileSync(failed.cursor_path), core);
-  assert.deepEqual(fs.readFileSync(queue), hourly);
-  assert.deepEqual(fs.readFileSync(project), projectBytes);
-  assert.equal(JSON.parse(core).projectHourly.projects[PROJECT_KEY].purge_pending, false);
+  const changed = await sync();
+  assert.equal(changed.cursor_commits, 1);
+  assert.deepEqual(readRows(queue), [ROW, { ...ROW, ...DOUBLE_TOTALS }]);
+  assert.deepEqual(readRows(project), [PROJECT_ROW, { ...PROJECT_ROW, ...ZERO_TOTALS }]);
+  const hourly = fs.readFileSync(queue);
   fail = false;
   const recovered = await sync();
-  assert.equal(recovered.cursor_commits, 0);
-  assert.deepEqual(fs.readFileSync(recovered.cursor_path), core);
+  assert.equal(recovered.cursor_commits, 1);
   assert.deepEqual(fs.readFileSync(queue), hourly);
-  assert.deepEqual(fs.readFileSync(project), projectBytes);
+  assert.deepEqual(readRows(project).at(-1), { ...PROJECT_ROW, ...DOUBLE_TOTALS });
+  const core = fs.readFileSync(recovered.cursor_path);
+  const repeat = await sync();
+  assert.equal(repeat.cursor_commits, 0);
+  assert.deepEqual(fs.readFileSync(repeat.cursor_path), core);
 });
 
 function finishedVerboseListError(fields = {}) {
@@ -697,140 +710,3 @@ for (const scenario of ["nonempty", "failed"]) {
     assert.deepEqual(readRows(project), [PROJECT_ROW, { ...PROJECT_ROW, ...DOUBLE_TOTALS }]);
   });
 }
-
-for (const kind of ["gitfile", "commondir", "config"]) {
-  test(`CodeQL Git metadata ${kind} content and metadata keep the identity checked before pathname replacement`, async (t) => {
-    const { home } = fixture(t);
-    const worktree = path.join(home, "codeql-worktree");
-    const admin = path.join(home, "admin-original");
-    const otherAdmin = path.join(home, "admin-replacement");
-    const common = path.join(home, "common-original.git");
-    const otherCommon = path.join(home, "common-replacement.git");
-    const gitfile = path.join(worktree, ".git");
-    const commondir = path.join(admin, "commondir");
-    const config = path.join(common, "config");
-    const otherRef = "https://github.com/acme/replacement-codeql";
-    write(gitfile, "gitdir: ../admin-original\n");
-    write(commondir, "../common-original.git\n");
-    write(config, `[remote "origin"]\n\turl = ${PROJECT_ROW.project_ref}.git\n`);
-    write(path.join(otherAdmin, "commondir"), "../common-replacement.git\n");
-    write(path.join(otherCommon, "config"), `[remote "origin"]\n\turl = ${otherRef}.git\n`);
-    const target = { gitfile, commondir, config }[kind];
-    const replacement = `${target}.replacement`;
-    const saved = `${target}.original`;
-    const replacementText = {
-      gitfile: "gitdir: ../admin-replacement\n",
-      commondir: "../common-replacement.git\n",
-      config: `[remote "origin"]\n\turl = ${otherRef}.git\n`,
-    }[kind];
-    write(replacement, replacementText);
-    fs.utimesSync(replacement, new Date("2001-01-01T00:00:00Z"), new Date("2001-01-01T00:00:00Z"));
-    const checkedConfig = fs.statSync(config);
-    const opened = [];
-    let replaced = false;
-    let pathnameReads = 0;
-    const runtime = scopedModules({ home,
-      onHandle(handle, file) { opened.push({ handle, file }); },
-      ioFailure(method, file, handle) {
-        if (method === "readFile" && file === target) {
-          if (!handle) pathnameReads += 1;
-          if (!replaced) {
-            for (const candidate of [target, replacement, saved]) {
-              assert.ok(path.resolve(candidate).startsWith(home + path.sep), "replacement stays in the synthetic fixture");
-            }
-            fs.renameSync(target, saved);
-            fs.renameSync(replacement, target);
-            replaced = true;
-          }
-        }
-        return null;
-      },
-    });
-    const helpers = runtime.load("src/lib/rollout.js").projectObservationTest;
-    const context = await helpers.resolveProjectContextForPath({ startDir: worktree, strictIo: true });
-    assert.equal(replaced, true, "the filesystem swap must really occur before the content read");
-    assert.equal(fs.readFileSync(target, "utf8"), replacementText);
-    assert.deepEqual(context, {
-      projectRef: PROJECT_ROW.project_ref, projectKey: PROJECT_KEY, status: "public_verified",
-      configPath: config, configMtimeMs: checkedConfig.mtimeMs, configSize: checkedConfig.size,
-    }, "the snapshot must not read replacement bytes or combine one file's stat with another's remote");
-    assert.equal(pathnameReads, 0);
-    assert.equal(opened.filter((entry) => entry.file === target).length, 1);
-    for (const { handle } of opened) assert.equal(handle.fd, -1, "every opened metadata descriptor is closed");
-  });
-}
-
-for (const strictIo of [false, true]) {
-  for (const scenario of ["success", "missing", "directory", "non-file", "stat-error", "read-error", "close-error"]) {
-    test(`CodeQL Git metadata ${scenario} closes handles with strictIo=${strictIo}`, async (t) => {
-      const { home, config } = fixture(t);
-      const target = scenario === "missing" ? path.join(home, "missing-config")
-        : scenario === "directory" ? path.dirname(config) : config;
-      const failure = Object.assign(new Error(`synthetic ${scenario}`), { code: scenario === "stat-error" ? "EACCES" : "EIO" });
-      const opened = [];
-      let openAttempts = 0;
-      let readAttempts = 0;
-      let pathnameReads = 0;
-      const runtime = scopedModules({ home,
-        onHandle(handle, file) {
-          if (file !== target) return;
-          opened.push(handle);
-          if (scenario === "non-file") {
-            const stat = handle.stat.bind(handle);
-            handle.stat = async () => ({ ...await stat(), isFile: () => false, isDirectory: () => false });
-          }
-        },
-        ioFailure(method, file, handle) {
-          if (file !== target) return null;
-          if (method === "open") openAttempts += 1;
-          if (method === "readFile") { readAttempts += 1; if (!handle) pathnameReads += 1; }
-          if ((scenario === "stat-error" && method === "stat") ||
-              (scenario === "read-error" && method === "readFile") ||
-              (scenario === "close-error" && method === "close")) return failure;
-          return null;
-        },
-      });
-      const helpers = runtime.load("src/lib/rollout.js").projectObservationTest;
-      if (strictIo && scenario.endsWith("-error")) {
-        await assert.rejects(helpers.readGitRemoteUrl(target, { strictIo }), (error) => error === failure);
-      } else {
-        assert.equal(await helpers.readGitRemoteUrl(target, { strictIo }),
-          scenario === "success" ? `${PROJECT_ROW.project_ref}.git` : null);
-      }
-      assert.equal(openAttempts, 1);
-      assert.equal(pathnameReads, 0, "metadata text must use descriptor reads only");
-      if (["missing", "directory", "non-file", "stat-error"].includes(scenario)) assert.equal(readAttempts, 0);
-      if (!["missing", "directory"].includes(scenario)) assert.equal(opened.length, 1);
-      for (const handle of opened) assert.equal(handle.fd, -1);
-    });
-  }
-}
-
-test("CodeQL Git metadata closes after read and close failures while preserving the original strict error", async (t) => {
-  const { home, config } = fixture(t);
-  const readFailure = Object.assign(new Error("synthetic read EIO"), { code: "EIO" });
-  const closeFailure = Object.assign(new Error("synthetic close EPERM"), { code: "EPERM" });
-  const opened = [];
-  const runtime = scopedModules({ home,
-    onHandle(handle) { opened.push(handle); },
-    ioFailure(method, file) {
-      if (file !== config) return null;
-      return method === "readFile" ? readFailure : method === "close" ? closeFailure : null;
-    },
-  });
-  const helpers = runtime.load("src/lib/rollout.js").projectObservationTest;
-  await assert.rejects(helpers.readGitRemoteUrl(config, { strictIo: true }), (error) => error === readFailure);
-  assert.equal(opened.length, 1);
-  assert.equal(opened[0].fd, -1);
-});
-
-test("CodeQL Git metadata uses nonblocking open where supported before inspecting a possibly special file", async (t) => {
-  const { home, config } = fixture(t);
-  const flags = [];
-  const runtime = scopedModules({ home, onOpen(file, args) {
-    if (file === config) flags.push(args[0]);
-  } });
-  const helpers = runtime.load("src/lib/rollout.js").projectObservationTest;
-  assert.equal(await helpers.readGitRemoteUrl(config, { strictIo: true }), `${PROJECT_ROW.project_ref}.git`);
-  assert.deepEqual(flags, [fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0)]);
-});
