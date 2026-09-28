@@ -16,7 +16,7 @@ const TOTALS = {
   reasoning_output_tokens: 0,
   total_tokens: 1100,
   billable_total_tokens: 1100,
-  total_cost_usd: 0.42,
+  total_cost_usd: 0,
   conversation_count: 1,
 };
 const ROW = {
@@ -81,7 +81,7 @@ async function withCommandCodeHome(run) {
       ], { diagnostics, cursorStoreOptions: { forceV2: true } });
       return diagnostics;
     };
-    const readCursors = async () => {
+    const readCursors = async (replacement) => {
       const store = await openCursorStore({
         trackerDir,
         cursorsPath: path.join(trackerDir, "cursors.json"),
@@ -89,6 +89,7 @@ async function withCommandCodeHome(run) {
         forceV2: true,
       });
       assert.equal(store.mode, "v2");
+      if (replacement) await store.commit(replacement);
       return store.cursors;
     };
     await run({
@@ -103,23 +104,49 @@ async function withCommandCodeHome(run) {
   }
 }
 
-test("cmdSync reconciles the last Command Code transcript's deletion and persists zero on restart", async () => {
+test("cmdSync retains the last Command Code transcript's usage after deletion and restart", async () => {
   await withCommandCodeHome(async ({ filePath, queuePath, sync, readCursors }) => {
     const initial = await sync();
     assert.equal(initial.cursor_commits, 1);
     assert.deepEqual(readRows(queuePath), [ROW]);
     fs.unlinkSync(filePath);
     const deletion = await sync();
-    const zero = Object.fromEntries(Object.keys(TOTALS).map((key) => [key, 0]));
-    assert.deepEqual(readRows(queuePath), [ROW, { ...ROW, ...zero }]);
-    assert.equal(deletion.cursor_commits, 1);
-    assert.deepEqual((await readCursors()).commandCode.messages, {});
+    assert.deepEqual(readRows(queuePath), [ROW]);
+    assert.equal(deletion.cursor_commits, 0, "deletion alone does not rewrite the durable cursor");
+    assert.ok((await readCursors()).commandCode.messages[`command-code:record-one|${T0}`]);
 
     const coreBefore = fs.readFileSync(deletion.cursor_path);
     const repeat = await sync();
-    assert.deepEqual(readRows(queuePath), [ROW, { ...ROW, ...zero }]);
+    assert.deepEqual(readRows(queuePath), [ROW]);
     assert.equal(repeat.cursor_commits, 0);
     assert.deepEqual(fs.readFileSync(repeat.cursor_path), coreBefore);
+  });
+});
+
+test("cmdSync persists compact schema once even with an unchanged v2 transcript", async () => {
+  await withCommandCodeHome(async ({ filePath, queuePath, sync, readCursors }) => {
+    await sync();
+    const previous = await readCursors();
+    const state = previous.commandCode;
+    state.version = 2;
+    state.fileCacheVersion = 1;
+    state.updatedAt = T0;
+    for (const value of Object.values(state.messages)) {
+      value.filePath = filePath;
+      value.updatedAt = T0;
+      value.conversationCount = 1;
+      value.totals = { ...TOTALS };
+    }
+    await readCursors(previous);
+    const queueBefore = fs.readFileSync(queuePath);
+    const migrated = await sync();
+    assert.equal(migrated.cursor_commits, 1);
+    assert.equal((await readCursors()).commandCode.version, 3);
+    assert.deepEqual(fs.readFileSync(queuePath), queueBefore);
+    const coreBefore = fs.readFileSync(migrated.cursor_path);
+    const repeated = await sync();
+    assert.equal(repeated.cursor_commits, 0);
+    assert.deepEqual(fs.readFileSync(repeated.cursor_path), coreBefore);
   });
 });
 
@@ -213,8 +240,7 @@ for (const [level, code] of [["root", "EACCES"], ["project", "EPERM"]]) {
       assert.deepEqual(readRows(queuePath), [ROW]);
       fs.unlinkSync(filePath);
       await sync();
-      const zero = Object.fromEntries(Object.keys(TOTALS).map((key) => [key, 0]));
-      assert.deepEqual(readRows(queuePath), [ROW, { ...ROW, ...zero }]);
+      assert.deepEqual(readRows(queuePath), [ROW]);
     });
   });
 }

@@ -14,7 +14,7 @@ const T0 = "2026-05-01T12:00:00.000Z";
 const TOTALS = {
   input_tokens: 1000, cached_input_tokens: 0, cache_creation_input_tokens: 0,
   output_tokens: 100, reasoning_output_tokens: 0, total_tokens: 1100,
-  billable_total_tokens: 1100, total_cost_usd: 0.42, conversation_count: 1,
+  billable_total_tokens: 1100, total_cost_usd: 0, conversation_count: 1,
 };
 const ROW = { source: "command-code", model: "deepseek-v4.1-flash", hour_start: T0, ...TOTALS };
 const PROJECT_KEY = "acme/synthetic-observation";
@@ -24,7 +24,7 @@ const PROJECT_ROW = {
 };
 const DOUBLE_TOTALS = {
   ...TOTALS, input_tokens: 2000, output_tokens: 200, total_tokens: 2200,
-  billable_total_tokens: 2200, total_cost_usd: 0.84, conversation_count: 2,
+  billable_total_tokens: 2200, total_cost_usd: 0, conversation_count: 2,
 };
 const ZERO_TOTALS = Object.fromEntries(Object.keys(TOTALS).map((key) => [key, 0]));
 
@@ -199,20 +199,22 @@ for (const [scenario, code] of [
       const expectedError = `${code}: ${injected.message}`;
       if (format === "JSON") {
         const summary = JSON.parse(output);
-        assert.deepEqual(summary.providers["command-code"], { installed: false, error: expectedError });
+        assert.deepEqual(summary.providers["command-code"], isWsl ? { installed: false } : { installed: false, error: expectedError });
         assert.deepEqual(summary.providers.cline, { installed: true, files: 1 });
         assert.equal(summary.queue.pending_bytes, pendingBytes);
         assert.equal(summary.queue.size_bytes, pendingBytes);
         assert.equal(typeof summary.hooks.claude, "boolean");
       } else {
         assert.match(output, /^TokenTracker v/m);
-        assert.ok(output.includes(`- Command Code: discovery failed (${expectedError})`));
+        if (isWsl) assert.ok(!output.includes("Command Code: discovery failed"));
+        else assert.ok(output.includes(`- Command Code: discovery failed (${expectedError})`));
         assert.match(output, /- Cline: passive reader \(1 transcript in 1 sessions dir\)/);
         assert.ok(output.includes(`- Queue: ${pendingBytes} bytes pending`));
       }
-      // Only status may downgrade the exception to a diagnostic. Sync still
-      // receives a strict discovery failure, never a successful empty scan.
-      await assert.rejects(runtime.load("src/lib/rollout.js").resolveCommandCodeSessionFiles(), (error) => error === injected);
+      // WSL-only can be empty on failure; native discovery errors stay visible.
+      const discovery = runtime.load("src/lib/rollout.js").resolveCommandCodeSessionFiles();
+      if (isWsl) assert.deepEqual(await discovery, []);
+      else await assert.rejects(discovery, (error) => error === injected);
       assert.equal(fs.statSync(queue).size, pendingBytes, "status is read-only");
     });
   }
@@ -263,7 +265,7 @@ for (const [method, target, code] of [
       const expected = {
         ...TOTALS, input_tokens: 1000 * sessions, output_tokens: 100 * sessions,
         total_tokens: 1100 * sessions, billable_total_tokens: 1100 * sessions,
-        total_cost_usd: 0.42 * sessions, conversation_count: sessions,
+        total_cost_usd: 0 * sessions, conversation_count: sessions,
       };
       assert.deepEqual(readRows(options.queuePath).at(-1), { ...ROW, ...expected });
       const projectRows = new Map(readRows(options.projectQueuePath).map((row) => [row.project_key, row]));
@@ -563,7 +565,7 @@ test("a later project's metadata failure does not discard an earlier file's new 
   await rollout.parseCommandCodeIncremental(options);
   const total = {
     ...TOTALS, input_tokens: 3000, output_tokens: 300, total_tokens: 3300,
-    billable_total_tokens: 3300, total_cost_usd: 1.26, conversation_count: 3,
+    billable_total_tokens: 3300, total_cost_usd: 0, conversation_count: 3,
   };
   assert.deepEqual(readRows(options.queuePath), [ROW, { ...ROW, ...total }]);
   assert.deepEqual(readRows(options.projectQueuePath), [PROJECT_ROW, { ...PROJECT_ROW, ...DOUBLE_TOTALS }]);
@@ -790,5 +792,60 @@ for (const scenario of ["nonempty", "failed"]) {
     assert.equal(repeated.cursor_commits, 0);
     assert.deepEqual(readRows(queue), [ROW, { ...ROW, ...DOUBLE_TOTALS }]);
     assert.deepEqual(readRows(project), [PROJECT_ROW, { ...PROJECT_ROW, ...DOUBLE_TOTALS }]);
+  });
+}
+
+for (const scenario of ["stub", "timeout", "identity", "existence", "UNC directory"]) {
+  test(`Command Code actual cmdSync keeps native usage on first and subsequent ${scenario} WSL failures`, async (t) => {
+    const { home, file, repo } = fixture(t);
+    const wslData = path.join(home, "synthetic-wsl", ".commandcode");
+    const wslFile = path.join(wslData, "projects", "fixture", "wsl.jsonl");
+    write(wslFile, `${JSON.stringify({ type: "session", id: "wsl", cwd: repo })}\n${message("wsl-m1")}\n`);
+    const aliases = ["\\\\wsl$\\Synthetic\\home\\fixture\\.commandcode", "\\\\wsl.localhost\\Synthetic\\home\\fixture\\.commandcode"];
+    let fail = true;
+    let failures = 0;
+    const runtime = scopedModules({
+      home, env: { TOKENTRACKER_WSL_MODE: "both" },
+      redirect(filename) {
+        for (const alias of aliases) {
+          if (filename === alias || filename.startsWith(alias + path.sep)) {
+            if (fail && scenario === "existence" && filename === alias) { failures++; throw Object.assign(new Error("synthetic WSL existence"), { code: "EACCES" }); }
+            return path.join(wslData, filename.slice(alias.length));
+          }
+        }
+        if (filename.startsWith("\\\\wsl")) throw Object.assign(new Error("non-fixture WSL path"), { code: "ENOENT" });
+        return filename;
+      },
+      ioFailure(method, filename) {
+        if (fail && scenario === "UNC directory" && method === "readdir" && filename === path.join(wslData, "projects")) {
+          failures++; return Object.assign(new Error("synthetic UNC directory"), { code: "EIO" });
+        }
+        return null;
+      },
+      runWsl(args) {
+        const list = args[0] === "-l";
+        if (fail && ((scenario === "stub" || scenario === "timeout") && list || scenario === "identity" && !list)) {
+          failures++;
+          throw scenario === "stub" ? finishedVerboseListError() : Object.assign(new Error("synthetic WSL failure"), { code: "ETIMEDOUT" });
+        }
+        return Buffer.from(list ? "  NAME STATE VERSION\n* Synthetic Running 2\n" : "fixture\n", list ? "utf16le" : "utf8");
+      },
+    });
+    const sync = async () => {
+      await runtime.load("src/commands/sync.js").cmdSync(["--auto", "--from-notify", "--source", "command-code", "--background", "--all-local-sources"], { cursorStoreOptions: { forceV2: true } });
+    };
+    const queue = path.join(home, ".tokentracker", "tracker", "queue.jsonl");
+    await sync();
+    assert.ok(failures > 0);
+    assert.equal(readRows(queue).at(-1)?.total_tokens, 1100);
+    fs.appendFileSync(file, message("native-new") + "\n");
+    await sync();
+    assert.equal(readRows(queue).at(-1).total_tokens, 2200);
+    fail = false;
+    await sync();
+    assert.equal(readRows(queue).at(-1).total_tokens, 3300);
+    const before = fs.readFileSync(queue);
+    await sync();
+    assert.deepEqual(fs.readFileSync(queue), before);
   });
 }

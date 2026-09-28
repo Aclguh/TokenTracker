@@ -1659,8 +1659,8 @@ async function cmdSync(argv, context = {}) {
     if (sourceAllowed("command-code")) {
       try {
         const commandCodeSessionFiles = await resolveCommandCodeSessionFiles(process.env);
-        // A successful empty discovery still retracts a previous ledger. I/O
-        // failures throw above and leave that provider's state retryable.
+        // Empty discovery preserves durable usage history. Native I/O failures
+        // remain visible; optional WSL failures do not suppress native usage.
         if (commandCodeSessionFiles.length > 0 || cursors.commandCode) {
           if (progress?.enabled) {
             progress.start(
@@ -3184,6 +3184,7 @@ async function cmdSync(argv, context = {}) {
       totalBuckets === 0 &&
       !(grokResult.projectBucketsQueued > 0) &&
       !(commandCodeResult.projectBucketsQueued > 0) &&
+      !commandCodeResult.schemaMigrated &&
       !codexColdAuditDue &&
       !codexFallbackRetryRan &&
       !grokHookSignalConsumed &&

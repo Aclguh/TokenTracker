@@ -327,14 +327,14 @@ test("commandCodeUsageToTotals subtracts cache reads from the cache-inclusive in
     reasoning_output_tokens: 0,
     total_tokens: 37654,
     billable_total_tokens: 37654,
-    total_cost_usd: 0.011206788,
+    total_cost_usd: 0,
     conversation_count: 1,
   });
 
   assert.equal(
-    commandCodeUsageToTotals({ inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }),
-    null,
-    "all-zero usage is not a billable event",
+    commandCodeUsageToTotals({ inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }).conversation_count,
+    0,
+    "explicit zero can correct history but is not a new billable event",
   );
   assert.equal(commandCodeUsageToTotals(null), null);
 
@@ -425,12 +425,12 @@ test("extractCommandCodeSessionUsage reads header, model and buckets without mat
 
   assert.equal(parsed.sessionId, "sess-9");
   assert.equal(parsed.cwd, "/home/user/project");
-  assert.equal(parsed.records.length, 2, "zero-usage and torn records are dropped");
+  assert.equal(parsed.records.length, 3, "explicit zero is retained for corrections; torn records are dropped");
   assert.equal(parsed.records[0].bucketStart, "2026-05-01T12:00:00.000Z");
   assert.equal(parsed.records[0].model, "deepseek-v4.1-flash");
-  assert.equal(parsed.records[1].bucketStart, "2026-05-01T12:30:00.000Z");
-  assert.equal(parsed.records[1].model, "gpt-6-sol");
-  assert.equal(parsed.records[1].totals.total_tokens, 550);
+  assert.equal(parsed.records[2].bucketStart, "2026-05-01T12:30:00.000Z");
+  assert.equal(parsed.records[2].model, "gpt-6-sol");
+  assert.equal(parsed.records[2].totals.total_tokens, 550);
 });
 
 test("parseCommandCodeIncremental queues the committed fixture, skips unchanged files, and dedups on rerun", async () => {
@@ -454,9 +454,7 @@ test("parseCommandCodeIncremental queues the committed fixture, skips unchanged 
   assert.equal(rows[0].input_tokens, 22918 - 7296 + 37768 - 7424 + 38950 - 37888 + 55659 - 39168 + 56742 - 56576 + 57818 - 57216);
   assert.equal(rows[0].cached_input_tokens, 7296 + 7424 + 37888 + 39168 + 56576 + 57216);
   assert.equal(rows[0].output_tokens, 14736 + 122 + 232 + 1073 + 587 + 165);
-  // The CLI display estimate is retained as metadata, not the pricing authority.
-  const expectedCost = 0.011206788 + 0.0046470719999999995 + 0.00041216399999999997 + 0.0032349539999999995 + 0.000546828 + 0.000360948;
-  assert.ok(Math.abs(rows[0].total_cost_usd - expectedCost) < 1e-12);
+  assert.equal(rows[0].total_cost_usd, 0, "readers compute cost using model pricing");
 
   // Second run: (size, mtime) unchanged, so the transcript is not re-read and
   // nothing is re-queued.
@@ -486,11 +484,11 @@ test("parseCommandCodeIncremental corrects an unversioned ledger even when file 
     assert.equal(first.eventsAggregated, 2, "the old identity is subtracted before the new identity is added");
     assert.equal(first.bucketsQueued, 1);
     assert.equal(first.projectBucketsQueued, 1);
-    const corrected = { ...oldTotals, input_tokens: 100, total_tokens: 770, billable_total_tokens: 770 };
+    const corrected = { ...oldTotals, input_tokens: 100, total_tokens: 770, billable_total_tokens: 770, total_cost_usd: 0 };
     assert.deepEqual(commandCodeRows(queuePath), [oldRow, { ...oldRow, ...corrected }]);
     assert.deepEqual(commandCodeRows(projectQueuePath), [oldProjectRow, { ...oldProjectRow, ...corrected }]);
-    assert.equal(cursors.commandCode.version, 2);
-    assert.deepEqual(cursors.commandCode.messages[messageKey].totals, corrected);
+    assert.equal(cursors.commandCode.version, 3);
+    assert.deepEqual(cursors.commandCode.messages[messageKey].totals, { input_tokens: 100, cached_input_tokens: 600, cache_creation_input_tokens: 50, output_tokens: 20 });
     assert.deepEqual(cursors.hourly.buckets[hourlyKey].totals, corrected);
     assert.deepEqual(cursors.projectHourly.buckets[projectBucketKey].totals, corrected);
     assert.deepEqual(cursors.commandCode.files[filePath], { size, mtimeMs });
@@ -536,7 +534,7 @@ for (const failedQueue of ["hourly", "project"]) {
       assert.equal(retry.eventsAggregated, 2);
       assert.equal(retry.bucketsQueued, 1, "the hourly correction must really be appended on retry");
       assert.equal(retry.projectBucketsQueued, 1, "the project correction must really be appended on retry");
-      const corrected = { ...oldTotals, input_tokens: 100, total_tokens: 770, billable_total_tokens: 770 };
+      const corrected = { ...oldTotals, input_tokens: 100, total_tokens: 770, billable_total_tokens: 770, total_cost_usd: 0 };
       const hourlyRows = commandCodeRows(queuePath);
       const projectRows = commandCodeRows(projectQueuePath);
       // A project-append failure can leave an hourly snapshot on disk. Retrying
@@ -545,7 +543,7 @@ for (const failedQueue of ["hourly", "project"]) {
       assert.equal(projectRows.length, 2);
       assert.deepEqual(hourlyRows.at(-1), { ...oldRow, ...corrected });
       assert.deepEqual(projectRows.at(-1), { ...oldProjectRow, ...corrected });
-      assert.equal(cursors.commandCode.version, 2);
+      assert.equal(cursors.commandCode.version, 3);
 
       const repeat = await parseCommandCodeIncremental({
         ...options, cursors: JSON.parse(JSON.stringify(cursors)),
@@ -613,7 +611,7 @@ test("parseCommandCodeIncremental keeps mixed-model cache accounting disjoint an
         reasoning_output_tokens: 0,
         total_tokens: fixture.total,
         billable_total_tokens: fixture.total,
-        total_cost_usd: fixture.costUsd,
+        total_cost_usd: 0,
         conversation_count: 1,
       }, fixture.id);
       assert.equal(computeRowCost(row), computeRowCost({ ...row, total_cost_usd: 0 }), `${fixture.id} uses model pricing`);
@@ -661,16 +659,15 @@ test("parseCommandCodeIncremental reconciles a rewritten transcript (resume/comp
     await parseCommandCodeIncremental({ sessionFiles: [filePath], cursors, queuePath });
 
     const buckets = latestCommandCodeRows(queuePath);
-    // The dropped record's bucket reconciles back to zero instead of being
-    // double counted or left behind.
-    assertBucket(buckets.get("deepseek-v4.1-flash|2026-05-01T12:00:00.000Z"), 0, 0, 0);
-    assertBucket(buckets.get("deepseek-v4.1-flash|2026-05-01T12:30:00.000Z"), 2000, 2200, 0.002);
-    assertBucket(buckets.get("deepseek-v4.1-flash|2026-05-01T13:00:00.000Z"), 3000, 3300, 0.003);
+    // Compaction cannot retract the missing historical record.
+    assertBucket(buckets.get("deepseek-v4.1-flash|2026-05-01T12:00:00.000Z"), 1000, 1100, 0);
+    assertBucket(buckets.get("deepseek-v4.1-flash|2026-05-01T12:30:00.000Z"), 2000, 2200, 0);
+    assertBucket(buckets.get("deepseek-v4.1-flash|2026-05-01T13:00:00.000Z"), 3000, 3300, 0);
 
     assert.equal(
       latestCommandCodeTokens(queuePath),
-      2200 + 3300,
-      "every surviving record is counted exactly once",
+      1100 + 2200 + 3300,
+      "history and surviving records are each counted once",
     );
 
     const repeat = await parseCommandCodeIncremental({ sessionFiles: [filePath], cursors, queuePath });
@@ -687,7 +684,7 @@ function assertBucket(row, inputTokens, totalTokens, cost) {
   assert.ok(Math.abs(row.total_cost_usd - cost) < 1e-12, `cost ~${cost}, got ${row.total_cost_usd}`);
 }
 
-test("parseCommandCodeIncremental drops a deleted session's contribution", async () => {
+test("parseCommandCodeIncremental retains a deleted session's contribution", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "commandcode-delete-"));
   const home = path.join(dir, ".commandcode");
   const projectDir = path.join(home, "projects", "slug");
@@ -711,8 +708,8 @@ test("parseCommandCodeIncremental drops a deleted session's contribution", async
     await parseCommandCodeIncremental({ sessionFiles: [secondPath], cursors, queuePath });
     assert.equal(
       latestCommandCodeTokens(queuePath),
-      770,
-      "a session whose transcript is gone stops contributing",
+      1100 + 770,
+      "missing transcripts cannot retract history",
     );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -822,7 +819,7 @@ const LIFECYCLE_TOTALS = {
   reasoning_output_tokens: 0,
   total_tokens: 1100,
   billable_total_tokens: 1100,
-  total_cost_usd: 0.42,
+  total_cost_usd: 0,
   conversation_count: 1,
 };
 const LIFECYCLE_ROW = {
@@ -926,7 +923,7 @@ for (const kind of ["fork", "clone"]) {
       fs.appendFileSync(childPath, messageLine({ id: "feedbeef", timestamp: "2026-05-01T12:15:00.000Z", costUsd: 0.42 }) + "\n");
       const doubled = {
         ...LIFECYCLE_TOTALS, input_tokens: 2000, output_tokens: 200,
-        total_tokens: 2200, billable_total_tokens: 2200, total_cost_usd: 0.84, conversation_count: 2,
+        total_tokens: 2200, billable_total_tokens: 2200, total_cost_usd: 0, conversation_count: 2,
       };
       roundTripLifecycleCursors(options);
       const append = await parseCommandCodeIncremental(options);
@@ -940,10 +937,10 @@ for (const kind of ["fork", "clone"]) {
       options.sessionFiles = options.sessionFiles.filter((file) => file !== removedPath);
       roundTripLifecycleCursors(options);
       await parseCommandCodeIncremental(options);
-      const survivingTotals = removed === "parent" ? doubled : LIFECYCLE_TOTALS;
+      const survivingTotals = doubled;
       assert.deepEqual(commandCodeRows(options.queuePath).at(-1), { ...LIFECYCLE_ROW, ...survivingTotals });
       assert.deepEqual(commandCodeRows(options.projectQueuePath).at(-1), lifecycleProjectRow("acme/lifecycle-fixture", survivingTotals));
-      assert.equal(options.cursors.commandCode.messages[inheritedKey].filePath, options.sessionFiles[0]);
+      assert.ok(options.cursors.commandCode.fileIndex[options.sessionFiles[0]].messageKeys.includes(inheritedKey));
       roundTripLifecycleCursors(options);
       const survivingRepeat = await parseCommandCodeIncremental(options);
       assert.equal(survivingRepeat.recordsProcessed, 0);
@@ -990,7 +987,7 @@ test("Command Code migrates a version-1 fork ledger with unchanged fingerprints 
     const { stat: { size, mtimeMs }, text } = readFixtureSnapshot(owner);
     const headerLength = Buffer.byteLength(text.split("\n")[0]);
     messages[key] = {
-      totals: { ...LIFECYCLE_TOTALS }, conversationCount: 1, bucketStart: T0,
+      totals: { ...LIFECYCLE_TOTALS, total_cost_usd: 0.42 }, conversationCount: 1, bucketStart: T0,
       model: LIFECYCLE_ROW.model, projectKey: project.project_key, projectRef: project.project_ref,
       filePath: owner, updatedAt: T0,
     };
@@ -1010,7 +1007,7 @@ test("Command Code migrates a version-1 fork ledger with unchanged fingerprints 
   roundTripLifecycleCursors(options);
   const migration = await parseCommandCodeIncremental(options);
   assert.equal(migration.recordsProcessed, 2, "the old file cache must be invalidated");
-  assert.equal(options.cursors.commandCode.version, 2);
+  assert.equal(options.cursors.commandCode.version, 3);
   assert.deepEqual(Object.keys(options.cursors.commandCode.messages), ["command-code:abc12345|2026-05-01T12:00:01.001Z"]);
   assert.deepEqual(commandCodeRows(options.queuePath), [oldRow, LIFECYCLE_ROW]);
   assert.deepEqual(commandCodeRows(options.projectQueuePath), [oldProjectRow, project]);
@@ -1046,7 +1043,7 @@ for (const removedIndex of [0, 1]) {
       await parseCommandCodeIncremental(options);
       assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW]);
       assert.deepEqual(commandCodeRows(options.projectQueuePath), [lifecycleProjectRow()]);
-      assert.equal(options.cursors.commandCode.messages[LIFECYCLE_KEY].filePath, options.sessionFiles[0]);
+      assert.ok(options.cursors.commandCode.fileIndex[options.sessionFiles[0]].messageKeys.includes(LIFECYCLE_KEY));
       roundTripLifecycleCursors(options);
 
       const repeat = await parseCommandCodeIncremental(options);
@@ -1073,7 +1070,7 @@ test("Command Code refreshes moved-file provenance even when accounting does not
     const move = await parseCommandCodeIncremental(options);
     assert.equal(move.bucketsQueued, 0);
     assert.equal(move.projectBucketsQueued, 0);
-    assert.equal(options.cursors.commandCode.messages[LIFECYCLE_KEY].filePath, moved);
+    assert.ok(options.cursors.commandCode.fileIndex[moved].messageKeys.includes(LIFECYCLE_KEY));
     assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW]);
     assert.deepEqual(commandCodeRows(options.projectQueuePath), [lifecycleProjectRow()]);
 
@@ -1106,7 +1103,7 @@ test("Command Code recovers version-1 file fingerprints with no new cache metada
     roundTripLifecycleCursors(options);
     const recovered = await parseCommandCodeIncremental(options);
     assert.equal(recovered.recordsProcessed, 1, "old fingerprints must be reread once");
-    assert.equal(options.cursors.commandCode.version, 2, "older accounting is upgraded");
+    assert.equal(options.cursors.commandCode.version, 3, "older accounting is upgraded");
     assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW]);
     assert.deepEqual(commandCodeRows(options.projectQueuePath), [lifecycleProjectRow()]);
     roundTripLifecycleCursors(options);
@@ -1152,7 +1149,7 @@ test("Command Code restores a differing duplicate when the winning transcript is
     await parseCommandCodeIncremental(options);
     const winningTotals = {
       ...LIFECYCLE_TOTALS, input_tokens: 2000, output_tokens: 200,
-      total_tokens: 2200, billable_total_tokens: 2200, total_cost_usd: 0.84,
+      total_tokens: 2200, billable_total_tokens: 2200, total_cost_usd: 0,
     };
     assert.deepEqual(commandCodeRows(options.queuePath), [{ ...LIFECYCLE_ROW, ...winningTotals }]);
     roundTripLifecycleCursors(options);
@@ -1166,7 +1163,7 @@ test("Command Code restores a differing duplicate when the winning transcript is
     assert.deepEqual(commandCodeRows(options.projectQueuePath), [
       lifecycleProjectRow("acme/lifecycle-fixture", winningTotals), lifecycleProjectRow(),
     ]);
-    assert.equal(options.cursors.commandCode.messages[LIFECYCLE_KEY].filePath, filePath);
+    assert.ok(options.cursors.commandCode.fileIndex[filePath].messageKeys.includes(LIFECYCLE_KEY));
     roundTripLifecycleCursors(options);
     const repeat = await parseCommandCodeIncremental(options);
     assert.equal(repeat.recordsProcessed, 0);
@@ -1215,7 +1212,7 @@ for (const [operation, code] of [
       const recoveredTotals = {
         ...LIFECYCLE_TOTALS, input_tokens: 2000, output_tokens: 200,
         total_tokens: 2200, billable_total_tokens: 2200,
-        total_cost_usd: 0.84, conversation_count: 2,
+        total_cost_usd: 0, conversation_count: 2,
       };
       assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW, { ...LIFECYCLE_ROW, ...recoveredTotals }]);
       assert.deepEqual(commandCodeRows(options.projectQueuePath), [
@@ -1234,17 +1231,16 @@ for (const [operation, code] of [
 }
 
 for (const replacement of ["missing", "directory"]) {
-  test(`Command Code treats a confirmed ${replacement} transcript as deleted`, async () => {
+  test(`Command Code retains history for a confirmed ${replacement} transcript`, async () => {
     const { dir, filePath, options } = makeLifecycleTree();
     try {
       await parseCommandCodeIncremental(options);
       fs.unlinkSync(filePath);
       if (replacement === "directory") fs.mkdirSync(filePath);
       await parseCommandCodeIncremental(options);
-      const zero = Object.fromEntries(Object.keys(LIFECYCLE_TOTALS).map((key) => [key, 0]));
-      assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW, { ...LIFECYCLE_ROW, ...zero }]);
-      assert.deepEqual(commandCodeRows(options.projectQueuePath), [lifecycleProjectRow(), lifecycleProjectRow("acme/lifecycle-fixture", zero)]);
-      assert.deepEqual(options.cursors.commandCode.messages, {});
+      assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW]);
+      assert.deepEqual(commandCodeRows(options.projectQueuePath), [lifecycleProjectRow()]);
+      assert.ok(options.cursors.commandCode.messages[LIFECYCLE_KEY]);
       roundTripLifecycleCursors(options);
       const repeat = await parseCommandCodeIncremental(options);
       assert.equal(repeat.eventsAggregated, 0);
@@ -1400,7 +1396,7 @@ test("Command Code propagates an unchanged-header read error without publishing 
 });
 
 for (const probe of ["native", "wsl"]) {
-  test(`Command Code rejects an incomplete Windows ${probe} home probe`, () => {
+  test(`Command Code isolates WSL errors while preserving native ${probe} home-probe behavior`, () => {
     const nativeHome = "C:\\synthetic\\.commandcode";
     const wslHome = "\\\\wsl$\\Synthetic\\home\\fixture\\.commandcode";
     const injected = Object.assign(new Error("synthetic home-probe failure"), { code: "EACCES" });
@@ -1413,19 +1409,20 @@ for (const probe of ["native", "wsl"]) {
       },
       discoverWslHome(provider, options) {
         assert.equal(provider, ".commandcode");
-        // The shared WSL helper catches failed existence probes. The provider
-        // must still surface their observation error before reconciling zero.
-        try { options.existsSync(wslHome); } catch (_error) {}
+        // Let the actual WSL failure reach the provider boundary.
+        options.existsSync(wslHome);
         return null;
       },
     };
-    assert.throws(() => resolveCommandCodeHomes({
+    const discover = () => resolveCommandCodeHomes({
       TOKENTRACKER_WSL_MODE: probe === "native" ? "native-only" : "wsl-only",
-    }, deps), (error) => error === injected);
+    }, deps);
+    if (probe === "native") assert.throws(discover, (error) => error === injected);
+    else assert.deepEqual(discover(), []);
   });
 }
 
-test("Command Code preserves both roots when one discovery fails and recovers pending healthy-root usage", async () => {
+test("Command Code retains WSL history while immediately counting healthy native-root usage", async () => {
   const { dir, home, filePath, repoDir, options } = makeLifecycleTree();
   const secondHome = path.join(dir, "synthetic-wsl", ".commandcode");
   const secondProject = path.join(secondHome, "projects", "second");
@@ -1447,27 +1444,23 @@ test("Command Code preserves both roots when one discovery fails and recovers pe
     await sync();
     const bothTotals = {
       ...LIFECYCLE_TOTALS, input_tokens: 2000, output_tokens: 200,
-      total_tokens: 2200, billable_total_tokens: 2200, total_cost_usd: 0.84, conversation_count: 2,
+      total_tokens: 2200, billable_total_tokens: 2200, total_cost_usd: 0, conversation_count: 2,
     };
     assert.deepEqual(commandCodeRows(options.queuePath), [{ ...LIFECYCLE_ROW, ...bothTotals }]);
-    const before = JSON.parse(JSON.stringify(options.cursors));
-    const hourlyBytes = fs.readFileSync(options.queuePath);
-    const projectBytes = fs.readFileSync(options.projectQueuePath);
     fs.appendFileSync(filePath, messageLine({ id: "m2", costUsd: 0.42 }) + "\n");
     const injected = Object.assign(new Error("synthetic second-root failure"), { code: "EIO" });
     fsp.readdir = async function (file, ...args) {
       if (file === secondProject) throw injected;
       return originalReadDir.call(this, file, ...args);
     };
-    await assert.rejects(sync(), (error) => error === injected);
-    assert.deepEqual(options.cursors, before);
-    assert.deepEqual(fs.readFileSync(options.queuePath), hourlyBytes);
-    assert.deepEqual(fs.readFileSync(options.projectQueuePath), projectBytes);
+    await sync();
+    assert.equal(latestCommandCodeTokens(options.queuePath), 3300);
+    assert.equal(commandCodeRows(options.projectQueuePath).at(-1).total_tokens, 3300);
     fsp.readdir = originalReadDir;
     await sync();
     const recoveredTotals = {
       ...LIFECYCLE_TOTALS, input_tokens: 3000, output_tokens: 300,
-      total_tokens: 3300, billable_total_tokens: 3300, total_cost_usd: 1.26, conversation_count: 3,
+      total_tokens: 3300, billable_total_tokens: 3300, total_cost_usd: 0, conversation_count: 3,
     };
     assert.deepEqual(commandCodeRows(options.queuePath), [
       { ...LIFECYCLE_ROW, ...bothTotals }, { ...LIFECYCLE_ROW, ...recoveredTotals },
@@ -1589,7 +1582,7 @@ test("Command Code rebuilds a transcript that changes during its cached header r
     assert.equal(changed.recordsProcessed, 2);
     const recoveredTotals = {
       ...LIFECYCLE_TOTALS, input_tokens: 2000, output_tokens: 200,
-      total_tokens: 2200, billable_total_tokens: 2200, total_cost_usd: 0.84, conversation_count: 2,
+      total_tokens: 2200, billable_total_tokens: 2200, total_cost_usd: 0, conversation_count: 2,
     };
     assert.deepEqual(commandCodeRows(options.queuePath), [LIFECYCLE_ROW, { ...LIFECYCLE_ROW, ...recoveredTotals }]);
     assert.deepEqual(commandCodeRows(options.projectQueuePath), [lifecycleProjectRow(), lifecycleProjectRow("acme/lifecycle-fixture", recoveredTotals)]);
@@ -1610,7 +1603,7 @@ test("Command Code retries an equal-size rewrite between a full read and its fin
   const { stat: beforeStat, text: originalText } = readFixtureSnapshot(filePath);
   const replacement = originalText.replace(
     messageLine({ id: "m1", costUsd: 0.42 }),
-    messageLine({ id: "m2", inputTokens: 2000, outputTokens: 200, costUsd: 0.84 }),
+    messageLine({ id: "m1", inputTokens: 2000, outputTokens: 200, costUsd: 0.84 }),
   );
   assert.notEqual(replacement, originalText);
   assert.equal(Buffer.byteLength(replacement), beforeStat.size, "the concurrent rewrite has exactly the same byte length");
@@ -1643,7 +1636,7 @@ test("Command Code retries an equal-size rewrite between a full read and its fin
     const recovered = await parseCommandCodeIncremental(options);
     const corrected = {
       ...LIFECYCLE_TOTALS, input_tokens: 2000, output_tokens: 200,
-      total_tokens: 2200, billable_total_tokens: 2200, total_cost_usd: 0.84,
+      total_tokens: 2200, billable_total_tokens: 2200, total_cost_usd: 0,
     };
     assert.equal(commandCodeRows(options.queuePath).at(-1).total_tokens, 2200);
     assert.equal(recovered.recordsProcessed, 1, "an ordinary subsequent sync must reread the unstable snapshot");
@@ -1651,7 +1644,7 @@ test("Command Code retries an equal-size rewrite between a full read and its fin
     assert.deepEqual(commandCodeRows(options.projectQueuePath), [
       lifecycleProjectRow(), lifecycleProjectRow("acme/lifecycle-fixture", corrected),
     ]);
-    assert.deepEqual(Object.keys(options.cursors.commandCode.messages), [`command-code:m2|${T0}`]);
+    assert.deepEqual(Object.keys(options.cursors.commandCode.messages), [`command-code:m1|${T0}`]);
     const hourlyBytes = fs.readFileSync(options.queuePath);
     const projectBytes = fs.readFileSync(options.projectQueuePath);
     roundTripLifecycleCursors(options);
@@ -1666,4 +1659,172 @@ test("Command Code retries an equal-size rewrite between a full read and its fin
     fsp.open = originalOpen;
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+for (const scenario of ["rediscovered deletion", "explicit empty", "deleted after enumeration", "reinstalled root", "single-record compaction"]) {
+  test(`durable history retains 1100 tokens and project bytes after ${scenario}`, async (t) => {
+    const { dir, home, filePath, repoDir, options } = makeLifecycleTree();
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    await parseCommandCodeIncremental(options);
+    const hourly = fs.readFileSync(options.queuePath);
+    const project = fs.readFileSync(options.projectQueuePath);
+    if (scenario === "single-record compaction") {
+      fs.writeFileSync(filePath, headerLine("sess-lifecycle", repoDir) + "\n");
+    } else if (scenario === "explicit empty") {
+      options.sessionFiles = [];
+    } else if (scenario === "reinstalled root") {
+      fs.renameSync(home, home + ".old");
+      fs.mkdirSync(path.join(home, "projects"), { recursive: true });
+      options.sessionFiles = await resolveCommandCodeSessionFiles({ TOKENTRACKER_COMMANDCODE_HOME: home });
+    } else {
+      fs.unlinkSync(filePath);
+      if (scenario === "rediscovered deletion") options.sessionFiles = await resolveCommandCodeSessionFiles({ TOKENTRACKER_COMMANDCODE_HOME: home });
+    }
+    for (let run = 0; run < 2; run++) {
+      roundTripLifecycleCursors(options);
+      const result = await parseCommandCodeIncremental(options);
+      assert.equal(result.bucketsQueued, 0);
+      assert.equal(result.projectBucketsQueued, 0);
+      assert.deepEqual(fs.readFileSync(options.queuePath), hourly);
+      assert.deepEqual(fs.readFileSync(options.projectQueuePath), project);
+      assert.equal(latestCommandCodeTokens(options.queuePath), 1100);
+      assert.ok(options.cursors.commandCode.messages[LIFECYCLE_KEY]);
+    }
+  });
+}
+
+test("durable history follows a home switch without recounting a duplicate and adds only a new record", async (t) => {
+  const { dir, filePath, options } = makeLifecycleTree();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  await parseCommandCodeIncremental(options);
+  const hourly = fs.readFileSync(options.queuePath);
+  const project = fs.readFileSync(options.projectQueuePath);
+  const switchedHome = path.join(dir, "switched");
+  const switched = path.join(switchedHome, "projects", "fixture", "new-session.jsonl");
+  fs.mkdirSync(path.dirname(switched), { recursive: true });
+  fs.copyFileSync(filePath, switched);
+  options.sessionFiles = await resolveCommandCodeSessionFiles({ TOKENTRACKER_COMMANDCODE_HOME: switchedHome });
+  roundTripLifecycleCursors(options);
+  await parseCommandCodeIncremental(options);
+  assert.deepEqual(fs.readFileSync(options.queuePath), hourly);
+  assert.deepEqual(fs.readFileSync(options.projectQueuePath), project);
+  fs.appendFileSync(switched, messageLine({ id: "new" }) + "\n");
+  await parseCommandCodeIncremental(options);
+  assert.equal(latestCommandCodeTokens(options.queuePath), 2200);
+  for (let run = 0; run < 2; run++) {
+    roundTripLifecycleCursors(options);
+    assert.equal((await parseCommandCodeIncremental(options)).eventsAggregated, 0);
+  }
+});
+
+test("durable history applies same-key downward, upward and explicit-zero corrections once", async (t) => {
+  const { dir, filePath, repoDir, options } = makeLifecycleTree();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  await parseCommandCodeIncremental(options);
+  for (const tokens of [500, 2000, 0]) {
+    fs.writeFileSync(filePath, `${headerLine("sess-lifecycle", repoDir)}\n${messageLine({ id: "m1", inputTokens: tokens, outputTokens: 0 })}\n`);
+    roundTripLifecycleCursors(options);
+    const changed = await parseCommandCodeIncremental(options);
+    assert.equal(changed.eventsAggregated, 1);
+    assert.equal(latestCommandCodeTokens(options.queuePath), tokens);
+    assert.equal(commandCodeRows(options.projectQueuePath).at(-1).total_tokens, tokens);
+    roundTripLifecycleCursors(options);
+    assert.equal((await parseCommandCodeIncremental(options)).eventsAggregated, 0);
+  }
+  fs.appendFileSync(filePath, messageLine({ id: "m1", timestamp: "2026-05-01T12:00:00.001Z" }) + "\n");
+  fs.appendFileSync(filePath, JSON.stringify({ type: "message", id: "placeholder", timestamp: T0, usage: {} }) + "\n");
+  await parseCommandCodeIncremental(options);
+  assert.equal(latestCommandCodeTokens(options.queuePath), 1100);
+  assert.equal(Object.keys(options.cursors.commandCode.messages).length, 2);
+});
+
+test("missing legacy session/id ledger survives repeated schema migration until its own evidence returns", async (t) => {
+  const { dir, filePath, oldRow, oldProjectRow, options } = makeLegacyCommandCodeTree();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const original = fs.readFileSync(filePath);
+  fs.unlinkSync(filePath);
+  for (let run = 0; run < 2; run++) {
+    roundTripLifecycleCursors(options);
+    await parseCommandCodeIncremental(options);
+    assert.deepEqual(commandCodeRows(options.queuePath), [oldRow]);
+    assert.deepEqual(commandCodeRows(options.projectQueuePath), [oldProjectRow]);
+    assert.ok(options.cursors.commandCode.messages["command-code:sess-migrate|m1"]);
+  }
+  fs.writeFileSync(filePath, original);
+  roundTripLifecycleCursors(options);
+  await parseCommandCodeIncremental(options);
+  assert.equal(latestCommandCodeTokens(options.queuePath), 770);
+  assert.equal(Object.keys(options.cursors.commandCode.messages).length, 1);
+});
+
+test("v2 exact-key compaction keeps missing history and old cost without enqueueing a cost-only replacement", async (t) => {
+  const { dir, filePath, options } = makeLifecycleTree();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const oldTotals = { ...LIFECYCLE_TOTALS, total_cost_usd: 0.42 };
+  const oldRow = { ...LIFECYCLE_ROW, ...oldTotals };
+  const oldProject = lifecycleProjectRow("acme/lifecycle-fixture", oldTotals);
+  const { stat: { size, mtimeMs }, text } = readFixtureSnapshot(filePath);
+  const queuedKey = "1000|0|0|100|0|1100|1100|0.42|1";
+  options.cursors = {
+    hourly: { version: 3, buckets: { [`command-code|${oldRow.model}|${T0}`]: { totals: { ...oldTotals }, queuedKey } }, groupQueued: {} },
+    projectHourly: { version: 2, projects: {}, buckets: { [`${oldProject.project_key}|command-code|${T0}`]: { ...oldProject, totals: { ...oldTotals }, queuedKey } } },
+    commandCode: { version: 2, fileCacheVersion: 1, updatedAt: T0,
+      messages: { [LIFECYCLE_KEY]: { totals: { ...oldTotals }, conversationCount: 1, bucketStart: T0, model: oldRow.model, projectKey: oldProject.project_key, projectRef: oldProject.project_ref, filePath, updatedAt: T0 } },
+      files: { [filePath]: { size, mtimeMs } },
+      fileIndex: { [filePath]: { messageKeys: [LIFECYCLE_KEY], headerRanges: [{ start: 0, length: Buffer.byteLength(text.split("\n")[0]) }] } },
+    },
+  };
+  fs.writeFileSync(options.queuePath, JSON.stringify(oldRow) + "\n");
+  fs.writeFileSync(options.projectQueuePath, JSON.stringify(oldProject) + "\n");
+  const original = fs.readFileSync(filePath);
+  fs.unlinkSync(filePath);
+  for (let run = 0; run < 2; run++) {
+    roundTripLifecycleCursors(options);
+    await parseCommandCodeIncremental(options);
+    assert.deepEqual(commandCodeRows(options.queuePath), [oldRow]);
+    assert.deepEqual(commandCodeRows(options.projectQueuePath), [oldProject]);
+    assert.ok(options.cursors.commandCode.messages[LIFECYCLE_KEY]);
+  }
+  fs.writeFileSync(filePath, original);
+  await parseCommandCodeIncremental(options);
+  assert.deepEqual(commandCodeRows(options.queuePath), [oldRow]);
+  fs.appendFileSync(filePath, messageLine({ id: "new" }) + "\n");
+  await parseCommandCodeIncremental(options);
+  assert.equal(commandCodeRows(options.queuePath).at(-1).total_tokens, 2200);
+  assert.equal(commandCodeRows(options.queuePath).at(-1).total_cost_usd, 0);
+  assert.equal(commandCodeRows(options.projectQueuePath).at(-1).total_cost_usd, 0);
+});
+
+test("standalone zero turns do not create history or force repeated body reads", async (t) => {
+  const { dir, filePath, options } = makeLifecycleTree();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.appendFileSync(filePath, messageLine({ id: "empty", inputTokens: 0, outputTokens: 0 }) + "\n");
+  await parseCommandCodeIncremental(options);
+  assert.equal(latestCommandCodeTokens(options.queuePath), 1100);
+  assert.deepEqual(Object.keys(options.cursors.commandCode.messages), [LIFECYCLE_KEY]);
+  roundTripLifecycleCursors(options);
+  const repeat = await parseCommandCodeIncremental(options);
+  assert.equal(repeat.recordsProcessed, 0);
+  assert.equal(repeat.bucketsQueued, 0);
+});
+
+test("compact Command Code cursor has no redundant record fields and stays byte-stable", async (t) => {
+  const { dir, repoDir, options } = makeLifecycleTree({ message: "PRIVATE_BODY_NEVER_PERSIST" });
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  await parseCommandCodeIncremental(options);
+  const state = options.cursors.commandCode;
+  assert.equal(state.version, 3);
+  assert.equal(Object.hasOwn(state, "updatedAt"), false);
+  const value = state.messages[LIFECYCLE_KEY];
+  for (const field of ["filePath", "updatedAt", "conversationCount", "cwd"]) assert.equal(Object.hasOwn(value, field), false, field);
+  for (const field of ["total_tokens", "billable_total_tokens", "reasoning_output_tokens", "total_cost_usd"]) assert.equal(Object.hasOwn(value.totals, field), false, field);
+  const before = JSON.stringify(state);
+  assert.equal(before.includes(repoDir), false);
+  assert.equal(before.includes("PRIVATE_BODY_NEVER_PERSIST"), false);
+  for (let run = 0; run < 2; run++) {
+    roundTripLifecycleCursors(options);
+    await parseCommandCodeIncremental(options);
+    assert.equal(JSON.stringify(options.cursors.commandCode), before);
+  }
+  assert.equal(commandCodeRows(options.queuePath)[0].total_cost_usd, 0);
 });

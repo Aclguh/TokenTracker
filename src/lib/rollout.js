@@ -6886,8 +6886,7 @@ async function parseClaudeScienceIncremental({
 
   const bucketsQueued = await enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets });
   const updatedAt = new Date().toISOString();
-  hourlyState.updatedAt = updatedAt;
-  state.updatedAt = updatedAt;
+  if (bucketsQueued > 0) hourlyState.updatedAt = updatedAt;
   cursors.hourly = hourlyState;
   cursors.claudeScience = state;
   return { recordsProcessed, eventsAggregated, bucketsQueued };
@@ -23573,19 +23572,19 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
 //     `uncached = inputTokens - cacheReadTokens - cacheWriteTokens`; keeping
 //     either cache category in input double counts it in `total_tokens`.
 //  2. `costUsd` is Command Code's display-rate estimate, not a billed amount.
-//     Keep it as usage metadata, but use the shared model price table for cost
-//     estimates in both local readers and cloud endpoints.
+//     Ignore it and emit the zero cost sentinel; local readers and cloud
+//     endpoints estimate cost from the shared model price table.
 //
 // Transcripts are append-only in practice, but a resume/compaction REWRITES the
 // file, so byte offsets are the wrong cursor shape here. This reader rebuilds a
-// per-file snapshot and reconciles it against a subtract-on-change ledger keyed
+// per-file snapshot and reconciles it against a durable observation ledger keyed
 // by `recordId|timestamp`. Forks and clones copy those fields into transcripts
 // with new session headers, so the header cannot be part of the key. Files whose
 // (size, mtime) pair is unchanged can reuse their owned ledger records. A
 // non-owning duplicate is re-read rather than storing a second full ledger.
 const COMMAND_CODE_SOURCE = "command-code";
-const COMMAND_CODE_STATE_VERSION = 2;
-const COMMAND_CODE_FILE_CACHE_VERSION = 1;
+const COMMAND_CODE_STATE_VERSION = 3;
+const COMMAND_CODE_FILE_CACHE_VERSION = 2;
 const COMMAND_CODE_HEADER_MAX_BYTES = 65536;
 const COMMAND_CODE_HOME_DIR = ".commandcode";
 const COMMAND_CODE_PROJECTS_DIR = "projects";
@@ -23618,25 +23617,24 @@ function resolveCommandCodeHomes(env = process.env, deps = {}) {
   const platform = deps.platform || process.platform;
   if (overridden || platform !== "win32") return [nativeHome];
 
-  // existsSync hides permission/sharing failures as absence. Capture those
-  // failures even when the shared WSL discovery helper swallows its probes.
   const probePath = deps.existsSync || ((candidate) => fssync.statSync(candidate).isDirectory());
-  let probeError = null;
   const existsSync = (candidate) => {
-    try {
-      return probePath(candidate);
-    } catch (error) {
-      if (!isCommandCodePathMissing(error) && !probeError) probeError = error;
-      return false;
+    try { return probePath(candidate); }
+    catch (error) {
+      if (isCommandCodePathMissing(error)) return false;
+      throw error;
     }
   };
+  // Native errors remain visible. WSL is optional and must not suppress native
+  // observations when its executable, identity or UNC existence probes fail.
   const nativeValue = wsl.shouldProbeNative(env) && existsSync(nativeHome) ? nativeHome : null;
-
   const discoverWslHome = deps.discoverWslHome || wsl.discoverWslHome;
-  const wslValue = wsl.shouldProbeWsl(env)
-    ? discoverWslHome(COMMAND_CODE_HOME_DIR, { ...deps, env, existsSync, strict: true })
-    : null;
-  if (probeError) throw probeError;
+  let wslValue = null;
+  if (wsl.shouldProbeWsl(env)) {
+    try {
+      wslValue = discoverWslHome(COMMAND_CODE_HOME_DIR, { ...deps, env, existsSync, strict: true });
+    } catch (_error) { }
+  }
   const resolved = wsl.resolveAllWin32Paths({
     nativeValue,
     wslValue,
@@ -23650,24 +23648,33 @@ function resolveCommandCodeHomes(env = process.env, deps = {}) {
 // sibling checkpoint snapshots and `.prompts.` sidecars are not transcripts
 // and must not inflate discovery or status session counts.
 async function resolveCommandCodeSessionFiles(env = process.env, deps = {}) {
-  const out = [];
-  const seen = new Set();
-  for (const home of resolveCommandCodeHomes(env, deps)) {
-    const projectsRoot = path.join(home, COMMAND_CODE_PROJECTS_DIR);
-    for (const project of await readCommandCodeDirectory(projectsRoot)) {
-      if (!project.isDirectory()) continue;
-      const projectDir = path.join(projectsRoot, project.name);
-      for (const entry of await readCommandCodeDirectory(projectDir)) {
-        if (!entry.isFile() || !isCommandCodeSessionLogName(entry.name)) continue;
-        const full = path.join(projectDir, entry.name);
-        if (seen.has(full)) continue;
-        seen.add(full);
-        out.push(full);
+  const out = new Set();
+  const homes = resolveCommandCodeHomes(env, deps);
+  const nativeHome = deps.nativeHome || resolveCommandCodeHome(env);
+  const overridden = typeof env?.TOKENTRACKER_COMMANDCODE_HOME === "string" && env.TOKENTRACKER_COMMANDCODE_HOME.trim();
+  for (const home of homes) {
+    const rootFiles = [];
+    try {
+      const projectsRoot = path.join(home, COMMAND_CODE_PROJECTS_DIR);
+      for (const project of await readCommandCodeDirectory(projectsRoot)) {
+        if (!project.isDirectory()) continue;
+        const projectDir = path.join(projectsRoot, project.name);
+        for (const entry of await readCommandCodeDirectory(projectDir)) {
+          if (!entry.isFile() || !isCommandCodeSessionLogName(entry.name)) continue;
+          rootFiles.push(path.join(projectDir, entry.name));
+        }
       }
+    } catch (error) {
+      const optionalWsl = !overridden && (deps.platform || process.platform) === "win32" && home !== nativeHome;
+      if (!optionalWsl) throw error;
+      // A selected wsl-first root may become inaccessible after discovery.
+      // Fall back to native without changing shared WSL callers' mode rules.
+      if (wsl.shouldProbeNative(env) && !homes.includes(nativeHome)) homes.push(nativeHome);
+      continue;
     }
+    for (const file of rootFiles) out.add(file);
   }
-  out.sort((a, b) => a.localeCompare(b));
-  return out;
+  return [...out].sort((a, b) => a.localeCompare(b));
 }
 
 function isCommandCodePathMissing(error) {
@@ -23679,7 +23686,7 @@ async function readCommandCodeDirectory(directory) {
     return await fs.readdir(directory, { withFileTypes: true });
   } catch (error) {
     if (isCommandCodePathMissing(error)) return [];
-    // An incomplete discovery must not reconcile inaccessible roots as empty.
+    // Native errors stay visible; optional WSL errors are isolated by the caller.
     throw error;
   }
 }
@@ -23697,8 +23704,8 @@ function normalizeCommandCodeModelName(value) {
 
 // Map Command Code's usage object onto disjoint queue columns. `inputTokens`
 // already includes cache reads and writes (see the section comment), so subtract
-// both back out first; returns null for an all-zero record. `costUsd` is retained
-// as raw display-estimate metadata only; readers always use model-table pricing.
+// both back out first. Explicit numeric zero usage can correct an existing
+// observation; empty placeholders are not usage. Cost uses model-table pricing.
 function commandCodeUsageToTotals(usage) {
   if (!usage || typeof usage !== "object") return null;
   const inclusiveInput = toNonNegativeInt(usage.inputTokens);
@@ -23706,9 +23713,13 @@ function commandCodeUsageToTotals(usage) {
   const cacheWrite = toNonNegativeInt(usage.cacheWriteTokens);
   const output = toNonNegativeInt(usage.outputTokens);
   const input = Math.max(0, inclusiveInput - cachedInput - cacheWrite);
-  if (input === 0 && cachedInput === 0 && cacheWrite === 0 && output === 0) return null;
   const total = input + cachedInput + cacheWrite + output;
-  const reportedCost = Number(usage.costUsd);
+  const explicitZero = ["inputTokens", "outputTokens"].every((field) =>
+    typeof usage[field] === "number" && Number.isFinite(usage[field]) && usage[field] === 0,
+  ) && ["cacheReadTokens", "cacheWriteTokens"].every((field) =>
+    usage[field] === undefined || (typeof usage[field] === "number" && usage[field] === 0),
+  );
+  if (total === 0 && !explicitZero) return null;
   return {
     input_tokens: input,
     cached_input_tokens: cachedInput,
@@ -23717,8 +23728,8 @@ function commandCodeUsageToTotals(usage) {
     reasoning_output_tokens: 0,
     total_tokens: total,
     billable_total_tokens: total,
-    total_cost_usd: Number.isFinite(reportedCost) && reportedCost > 0 ? reportedCost : 0,
-    conversation_count: 1,
+    total_cost_usd: 0,
+    conversation_count: total > 0 ? 1 : 0,
   };
 }
 
@@ -23794,22 +23805,46 @@ function extractCommandCodeSessionUsage(text) {
   return { sessionId, cwd, records, headerRanges };
 }
 
+// Four independent counters are sufficient for current observations. Keep
+// legacy totals verbatim until a surviving session/id proves their replacement.
+function compactCommandCodeMessage(value, legacy = false) {
+  const totals = legacy ? { ...value.totals } : {
+    input_tokens: value.totals.input_tokens || 0,
+    cached_input_tokens: value.totals.cached_input_tokens || 0,
+    cache_creation_input_tokens: value.totals.cache_creation_input_tokens || 0,
+    output_tokens: value.totals.output_tokens || 0,
+  };
+  return {
+    totals, bucketStart: value.bucketStart, model: value.model,
+    projectKey: value.projectKey || null, projectRef: value.projectRef || null,
+    ...(legacy ? { legacy: true } : {}),
+  };
+}
+
+function expandCommandCodeTotals(totals) {
+  const total = totals.input_tokens + totals.cached_input_tokens + totals.cache_creation_input_tokens + totals.output_tokens;
+  return {
+    ...totals,
+    reasoning_output_tokens: totals.reasoning_output_tokens || 0,
+    total_tokens: totals.total_tokens ?? total,
+    billable_total_tokens: totals.billable_total_tokens ?? totals.total_tokens ?? total,
+    total_cost_usd: 0,
+    conversation_count: totals.conversation_count ?? (total > 0 ? 1 : 0),
+  };
+}
+
 function normalizeCommandCodeState(raw) {
   const messages = {};
-  if (raw && typeof raw === "object" && raw.messages && typeof raw.messages === "object") {
+  if (raw?.messages && typeof raw.messages === "object") {
     for (const [key, value] of Object.entries(raw.messages)) {
-      if (!value || typeof value !== "object") continue;
-      if (!value.totals || !value.bucketStart || !value.model) continue;
-      messages[key] = value;
+      if (!value?.totals || !value.bucketStart || !value.model) continue;
+      messages[key] = compactCommandCodeMessage(value, !raw.version || raw.version < 2 || value.legacy === true);
     }
   }
   const files = {};
-  // Re-read older accounting versions even when file metadata is unchanged,
-  // retaining their message totals above so reconciliation subtracts them first.
-  if (
-    raw && typeof raw === "object" && raw.version === COMMAND_CODE_STATE_VERSION &&
-    raw.files && typeof raw.files === "object"
-  ) {
+  // v2 already uses exact id|timestamp accounting. Legacy session/id caches
+  // must be reread once, but absent legacy ledger rows are never discarded.
+  if (raw?.version >= 2 && raw.files && typeof raw.files === "object") {
     for (const [key, value] of Object.entries(raw.files)) {
       if (!value || typeof value !== "object") continue;
       const size = Number(value.size);
@@ -23819,10 +23854,7 @@ function normalizeCommandCodeState(raw) {
     }
   }
   const fileIndex = {};
-  // Accounting-v1 fingerprints alone do not prove a complete file snapshot.
-  // Missing/older indexes force one reread while retaining the old ledger for
-  // subtraction, including caches whose surviving duplicate was retracted.
-  if (raw?.fileCacheVersion === COMMAND_CODE_FILE_CACHE_VERSION && raw.fileIndex) {
+  if ((raw?.fileCacheVersion === COMMAND_CODE_FILE_CACHE_VERSION || raw?.version === 2 && raw.fileCacheVersion === 1) && raw.fileIndex) {
     for (const [key, value] of Object.entries(raw.fileIndex)) {
       if (!files[key] || !Array.isArray(value?.messageKeys) || !Array.isArray(value.headerRanges)) continue;
       if (value.messageKeys.some((entry) => typeof entry !== "string")) continue;
@@ -23837,23 +23869,19 @@ function normalizeCommandCodeState(raw) {
       fileIndex[key] = {
         messageKeys: [...new Set(value.messageKeys)],
         headerRanges: value.headerRanges.map(({ start, length }) => ({ start, length })),
+        completeOwnedSnapshot: raw.version === 2
+          ? value.messageKeys.every((messageKey) => raw.messages?.[messageKey]?.filePath === key)
+          : value.completeOwnedSnapshot === true,
       };
     }
   }
-  return {
-    version: COMMAND_CODE_STATE_VERSION,
-    fileCacheVersion: COMMAND_CODE_FILE_CACHE_VERSION,
-    messages,
-    files,
-    fileIndex,
-    updatedAt: typeof raw?.updatedAt === "string" ? raw.updatedAt : null,
-  };
+  return { version: COMMAND_CODE_STATE_VERSION, fileCacheVersion: COMMAND_CODE_FILE_CACHE_VERSION, messages, files, fileIndex };
 }
 
 // Snapshot one transcript through a single descriptor: the change check and the
 // read share one handle, so a writer cannot swap the file between them (the
 // TOCTOU shape CodeQL reports as js/file-system-race). Returns null for a
-// missing or non-file path so reconciliation can retract it. Other observation
+// missing or non-file path while preserving durable history. Other observation
 // failures propagate before any queues or cursors are published.
 async function readCommandCodeSessionSnapshot(filePath, previous = null, headerRanges = null) {
   let handle;
@@ -23914,8 +23942,8 @@ async function readCommandCodeSessionSnapshot(filePath, previous = null, headerR
 
 // Rebuild-and-diff sync for `~/.commandcode/projects/**/*.jsonl`. A record's
 // identity is `recordId|timestamp`, so a rewritten or forked transcript
-// reconciles instead of double counting. A deleted file stops contributing
-// only records no surviving transcript owns. Cursor state is committed after
+// reconciles instead of double counting. Missing records retain their history;
+// only surviving observations can correct it. Cursor state is committed after
 // both queue appends succeed, so a failed write retries without losing or
 // inflating usage.
 async function parseCommandCodeIncremental({
@@ -23933,6 +23961,8 @@ async function parseCommandCodeIncremental({
   // through the original cursors before both queues have succeeded.
   const hourlyState = normalizeHourlyState(structuredClone(cursors?.hourly));
   const state = normalizeCommandCodeState(cursors?.commandCode);
+  const schemaMigrated = Boolean(cursors?.commandCode &&
+    cursors.commandCode.version !== COMMAND_CODE_STATE_VERSION);
   const projectEnabled = typeof projectQueuePath === "string" && projectQueuePath.length > 0;
   const projectState = projectEnabled
     ? normalizeProjectState(structuredClone(cursors?.projectHourly))
@@ -23944,6 +23974,8 @@ async function parseCommandCodeIncremental({
   const cb = typeof onProgress === "function" ? onProgress : null;
 
   const currentByKey = new Map();
+  const currentOwners = new Map();
+  const observedLegacyKeys = new Set();
   const nextFiles = {};
   const nextFileIndex = {};
   let recordsProcessed = 0;
@@ -23951,7 +23983,7 @@ async function parseCommandCodeIncremental({
   for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
     const filePath = files[fileIdx];
     const index = state.fileIndex[filePath];
-    const ownsSnapshot = index && index.messageKeys.every((key) => state.messages[key]?.filePath === filePath);
+    const ownsSnapshot = index?.completeOwnedSnapshot && index.messageKeys.every((key) => state.messages[key] && !state.messages[key].legacy);
     const snapshot = await readCommandCodeSessionSnapshot(
       filePath,
       ownsSnapshot ? state.files[filePath] : null,
@@ -23981,10 +24013,11 @@ async function parseCommandCodeIncremental({
     }
 
     if (snapshot.unchanged) {
-      nextFileIndex[filePath] = index;
+      nextFileIndex[filePath] = { ...index };
       for (const key of index.messageKeys) {
         const value = state.messages[key];
         currentByKey.set(key, projectEnabled ? { ...value, projectKey, projectRef } : value);
+        currentOwners.set(key, filePath);
       }
       continue;
     }
@@ -23994,14 +24027,15 @@ async function parseCommandCodeIncremental({
       recordsProcessed += 1;
       const key = `${COMMAND_CODE_SOURCE}:${record.id}|${record.timestamp}`;
       messageKeys.add(key);
-      currentByKey.set(key, {
+      if (parsed.sessionId) observedLegacyKeys.add(`${COMMAND_CODE_SOURCE}:${parsed.sessionId}|${record.id}`);
+      currentOwners.set(key, filePath);
+      currentByKey.set(key, compactCommandCodeMessage({
         totals: record.totals,
         bucketStart: record.bucketStart,
         model: record.model,
         projectKey,
         projectRef,
-        filePath,
-      });
+      }));
     }
     nextFileIndex[filePath] = { messageKeys: [...messageKeys], headerRanges: parsed.headerRanges };
 
@@ -24018,105 +24052,72 @@ async function parseCommandCodeIncremental({
 
   let eventsAggregated = 0;
 
-  // Subtract contributions that disappeared or changed.
-  for (const [key, prev] of Object.entries(state.messages)) {
-    const cur = currentByKey.get(key);
-    const unchanged =
-      cur &&
-      totalsKey(prev.totals) === totalsKey(cur.totals) &&
-      prev.bucketStart === cur.bucketStart &&
-      prev.model === cur.model &&
-      (prev.projectKey || null) === (cur.projectKey || null) &&
-      (prev.totals?.total_cost_usd || 0) === (cur.totals.total_cost_usd || 0);
-    if (unchanged) {
-      // A move or surviving duplicate can have identical totals but a new
-      // canonical owner. Persist that provenance for the next unchanged scan.
-      state.messages[key] = { ...prev, filePath: cur.filePath, projectRef: cur.projectRef };
-      continue;
-    }
-    if (prev.totals && prev.bucketStart && prev.model) {
-      const oldBucket = getHourlyBucket(hourlyState, COMMAND_CODE_SOURCE, prev.model, prev.bucketStart);
-      subtractTotals(oldBucket.totals, prev.totals);
-      touchedBuckets.add(bucketKey(COMMAND_CODE_SOURCE, prev.model, prev.bucketStart));
-      if (projectEnabled && prev.projectKey) {
-        const oldProjectBucket = getProjectBucket(
-          projectState,
-          prev.projectKey,
-          COMMAND_CODE_SOURCE,
-          prev.bucketStart,
-          prev.projectRef || null,
-        );
-        subtractTotals(oldProjectBucket.totals, prev.totals);
-        projectTouchedBuckets.add(
-          projectBucketKey(prev.projectKey, COMMAND_CODE_SOURCE, prev.bucketStart),
-        );
-      }
-    }
-    if (cur) {
-      const bucket = getHourlyBucket(hourlyState, COMMAND_CODE_SOURCE, cur.model, cur.bucketStart);
-      addTotals(bucket.totals, cur.totals);
-      touchedBuckets.add(bucketKey(COMMAND_CODE_SOURCE, cur.model, cur.bucketStart));
-      if (projectEnabled && cur.projectKey) {
-        const projectBucket = getProjectBucket(
-          projectState,
-          cur.projectKey,
-          COMMAND_CODE_SOURCE,
-          cur.bucketStart,
-          cur.projectRef,
-        );
-        addTotals(projectBucket.totals, cur.totals);
-        projectTouchedBuckets.add(
-          projectBucketKey(cur.projectKey, COMMAND_CODE_SOURCE, cur.bucketStart),
-        );
-      }
-      state.messages[key] = {
-        totals: cur.totals,
-        conversationCount: cur.totals.conversation_count,
-        bucketStart: cur.bucketStart,
-        model: cur.model,
-        projectKey: cur.projectKey,
-        projectRef: cur.projectRef,
-        filePath: cur.filePath,
-        updatedAt: new Date().toISOString(),
-      };
-      eventsAggregated += 1;
-    } else {
-      delete state.messages[key];
-      eventsAggregated += 1;
+  function applyObservation(value, subtract = false) {
+    const totals = expandCommandCodeTotals(value.totals);
+    const apply = subtract ? subtractTotals : addTotals;
+    apply(getHourlyBucket(hourlyState, COMMAND_CODE_SOURCE, value.model, value.bucketStart).totals, totals);
+    touchedBuckets.add(bucketKey(COMMAND_CODE_SOURCE, value.model, value.bucketStart));
+    if (projectEnabled && value.projectKey) {
+      apply(getProjectBucket(projectState, value.projectKey, COMMAND_CODE_SOURCE, value.bucketStart, value.projectRef).totals, totals);
+      projectTouchedBuckets.add(projectBucketKey(value.projectKey, COMMAND_CODE_SOURCE, value.bucketStart));
     }
   }
 
-  // Add brand-new keys.
-  for (const [key, cur] of currentByKey.entries()) {
-    if (state.messages[key]) continue;
-    const bucket = getHourlyBucket(hourlyState, COMMAND_CODE_SOURCE, cur.model, cur.bucketStart);
-    addTotals(bucket.totals, cur.totals);
-    touchedBuckets.add(bucketKey(COMMAND_CODE_SOURCE, cur.model, cur.bucketStart));
-    if (projectEnabled && cur.projectKey) {
-      const projectBucket = getProjectBucket(
-        projectState,
-        cur.projectKey,
-        COMMAND_CODE_SOURCE,
-        cur.bucketStart,
-        cur.projectRef,
-      );
-      addTotals(projectBucket.totals, cur.totals);
-      projectTouchedBuckets.add(
-        projectBucketKey(cur.projectKey, COMMAND_CODE_SOURCE, cur.bucketStart),
-      );
-    }
-    state.messages[key] = {
-      totals: cur.totals,
-      conversationCount: cur.totals.conversation_count,
-      bucketStart: cur.bucketStart,
-      model: cur.model,
-      projectKey: cur.projectKey,
-      projectRef: cur.projectRef,
-      filePath: cur.filePath,
-      updatedAt: new Date().toISOString(),
-    };
+  // Legacy session-based identities can only be removed when that session/id
+  // actually survives. An empty or partially compacted source proves nothing.
+  for (const [key, prev] of Object.entries(state.messages)) {
+    if (!prev.legacy || !observedLegacyKeys.has(key)) continue;
+    applyObservation(prev, true);
+    delete state.messages[key];
     eventsAggregated += 1;
   }
+
+  for (const [key, prev] of Object.entries(state.messages)) {
+    if (!currentByKey.has(key)) continue;
+    const cur = currentByKey.get(key);
+    const unchanged =
+      totalsKey(expandCommandCodeTotals(prev.totals)) === totalsKey(expandCommandCodeTotals(cur.totals)) &&
+      prev.bucketStart === cur.bucketStart && prev.model === cur.model &&
+      prev.projectKey === cur.projectKey;
+    if (!unchanged) {
+      applyObservation(prev, true);
+      applyObservation(cur);
+      eventsAggregated += 1;
+    }
+    state.messages[key] = cur;
+  }
+
+  for (const [key, cur] of currentByKey) {
+    if (state.messages[key]) continue;
+    // A standalone zero is an empty turn, not a new accounting event. Retain
+    // zeros only as corrections to a previously counted exact-key record.
+    if (expandCommandCodeTotals(cur.totals).total_tokens === 0) continue;
+    applyObservation(cur);
+    state.messages[key] = cur;
+    eventsAggregated += 1;
+  }
+
+  for (const [filePath, index] of Object.entries(nextFileIndex)) {
+    // New zero-only turns have no ledger contribution to cache or reconcile.
+    index.messageKeys = index.messageKeys.filter((key) => state.messages[key]);
+    index.completeOwnedSnapshot = index.messageKeys.every((key) => currentOwners.get(key) === filePath && state.messages[key]);
+  }
+
+  // Ignore cost-only changes (including old display estimates). The zero
+  // sentinel is written only when actual accounting otherwise queues a bucket.
+  function prepareBuckets(touched, next, previous) {
+    for (const key of touched) {
+      const totals = next.buckets[key].totals;
+      const old = previous?.buckets?.[key]?.totals;
+      if (old && totalsKey({ ...old, total_cost_usd: 0 }) === totalsKey({ ...totals, total_cost_usd: 0 })) {
+        touched.delete(key);
+        continue;
+      }
+      totals.total_cost_usd = 0;
+    }
+  }
+  prepareBuckets(touchedBuckets, hourlyState, cursors?.hourly);
+  if (projectEnabled) prepareBuckets(projectTouchedBuckets, projectState, cursors?.projectHourly);
 
   const bucketsQueued = await enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets });
   const projectBucketsQueued = projectEnabled
@@ -24124,14 +24125,13 @@ async function parseCommandCodeIncremental({
     : 0;
 
   const updatedAt = new Date().toISOString();
-  hourlyState.updatedAt = updatedAt;
-  state.updatedAt = updatedAt;
+  if (bucketsQueued > 0) hourlyState.updatedAt = updatedAt;
   state.files = nextFiles;
   state.fileIndex = nextFileIndex;
   cursors.hourly = hourlyState;
   cursors.commandCode = state;
   if (projectState) {
-    projectState.updatedAt = updatedAt;
+    if (projectBucketsQueued > 0) projectState.updatedAt = updatedAt;
     cursors.projectHourly = projectState;
   }
 
@@ -24141,6 +24141,7 @@ async function parseCommandCodeIncremental({
     eventsAggregated,
     bucketsQueued,
     projectBucketsQueued,
+    schemaMigrated,
   };
 }
 
