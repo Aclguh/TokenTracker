@@ -24,6 +24,14 @@
     ],
     "icon": [
       "icons/icon.png"
-    ]
+    ],
+    "linux": {
+      "deb": {
+        "desktopTemplate": "linux/tokentracker.desktop.hbs"
+      },
+      "rpm": {
+        "desktopTemplate": "linux/tokentracker.desktop.hbs"
+      }
+    }
   }
 }
