@@ -13,8 +13,7 @@ const WEBKIT_DMABUF_ENV: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
 
 const NATIVE_OAUTH_BRIDGE: &str = r#"
 (() => {
-  const host = window.location.hostname;
-  if (host !== '127.0.0.1' && host !== 'localhost') return;
+  if (window.location.hostname !== '127.0.0.1') return;
   const handler = {
     postMessage(url) {
       return window.__TAURI_INTERNALS__.invoke('open_oauth', { url });

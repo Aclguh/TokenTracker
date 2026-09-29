@@ -168,9 +168,9 @@ export function InsforgeAuthProvider({ children }) {
         if (result.data?.url) {
           // Tell the local server that the next /auth/callback is a native app flow.
           // The callback page (in system browser) checks this flag to relay code back to app.
-          // Best effort on macOS/Windows: native OAuth can still continue without
-          // the marker. The Linux server only hands the browser's return to the
-          // app when it is set, so there a sign-in without it can never finish.
+          // Without the marker the callback page tries to exchange the code in the
+          // browser, which has no PKCE verifier, so the sign-in can never finish.
+          // Linux stops here; macOS/Windows keep their best-effort behavior.
           const markerStored = await putNativeAuthMarker(true);
           if (!markerStored && isNativeLinuxApp()) {
             return { error: new Error(copy("login.oauth.desktop_start_failed")) };

@@ -1569,15 +1569,7 @@ function createLocalApiHandler({ queuePath }) {
     return hasAllowedLoopbackOrigin(req?.headers || {});
   }
 
-  // One-time read, so a relay is spent by whichever reader sees it first.
-  function takeNativeAuthPending() {
-    const isNative = _nativeAuthPending && Date.now() < _nativeAuthExpiry;
-    _nativeAuthPending = false;
-    _nativeAuthExpiry = 0;
-    return isNative;
-  }
-
-  return Object.assign(async function handleLocalApi(req, res, url) {
+  return async function handleLocalApi(req, res, url) {
     const p = url.pathname;
 
     if (p === "/api/local-auth") {
@@ -1677,7 +1669,10 @@ function createLocalApiHandler({ queuePath }) {
         return true;
       }
       if (method === "GET") {
-        json(res, { native: takeNativeAuthPending() });
+        const isNative = _nativeAuthPending && Date.now() < _nativeAuthExpiry;
+        _nativeAuthPending = false; // one-time read
+        _nativeAuthExpiry = 0;
+        json(res, { native: isNative });
         return true;
       }
       json(res, { error: "Method Not Allowed" }, 405);
@@ -3261,7 +3256,7 @@ function createLocalApiHandler({ queuePath }) {
     }
 
     return false;
-  }, { takeNativeAuthPending });
+  };
 }
 
 module.exports = {
