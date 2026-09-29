@@ -3,6 +3,7 @@ const fssync = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
+const { isDeepStrictEqual } = require("node:util");
 
 const crypto = require("node:crypto");
 const { ensureDir, writeJson, chmod600IfPossible } = require("./fs");
@@ -24169,6 +24170,9 @@ async function parseCommandCodeIncremental({
   if (bucketsQueued > 0) hourlyState.updatedAt = updatedAt;
   state.files = nextFiles;
   state.fileIndex = nextFileIndex;
+  // Non-owning fork copies are reread to resolve conflicts, but those reads
+  // alone need not rewrite an identical persistent ledger and file index.
+  const cursorUnchanged = isDeepStrictEqual(state, cursors.commandCode);
   cursors.hourly = hourlyState;
   cursors.commandCode = state;
   if (projectState) {
@@ -24183,6 +24187,7 @@ async function parseCommandCodeIncremental({
     bucketsQueued,
     projectBucketsQueued,
     schemaMigrated,
+    cursorUnchanged,
   };
 }
 

@@ -3180,7 +3180,7 @@ async function cmdSync(argv, context = {}) {
       !isFullSourceScan &&
       cursorStore.mode === "v2" &&
       cursorStore.requiresCommit !== true &&
-      totalParsed === 0 &&
+      totalParsed === (commandCodeResult.cursorUnchanged ? commandCodeResult.recordsProcessed : 0) &&
       totalBuckets === 0 &&
       !(grokResult.projectBucketsQueued > 0) &&
       !(commandCodeResult.projectBucketsQueued > 0) &&

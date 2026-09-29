@@ -123,6 +123,29 @@ test("cmdSync retains the last Command Code transcript's usage after deletion an
   });
 });
 
+test("cmdSync does not rewrite an unchanged cursor for fork copies", async () => {
+  await withCommandCodeHome(async ({ filePath, projectDir, queuePath, sync }) => {
+    const copy = path.join(projectDir, "fork-copy.jsonl");
+    const lines = fs.readFileSync(filePath, "utf8").trim().split("\n");
+    const header = JSON.parse(lines[0]);
+    header.id = "fork-session";
+    fs.writeFileSync(copy, [JSON.stringify(header), ...lines.slice(1)].join("\n") + "\n");
+    const first = await sync();
+    const before = fs.readFileSync(first.cursor_path);
+    assert.deepEqual(readRows(queuePath), [ROW]);
+    for (let run = 0; run < 2; run++) {
+      const repeat = await sync();
+      assert.equal(repeat.cursor_commits, 0);
+      assert.deepEqual(fs.readFileSync(repeat.cursor_path), before);
+      assert.deepEqual(readRows(queuePath), [ROW]);
+    }
+    const extra = { ...JSON.parse(lines[1]), id: "fork-new" };
+    fs.appendFileSync(copy, JSON.stringify(extra) + "\n");
+    assert.equal((await sync()).cursor_commits, 1);
+    assert.equal(readRows(queuePath).at(-1).total_tokens, 2200);
+  });
+});
+
 for (const [version, fileCacheVersion] of [[2, 1], [3, 2]]) {
   test(`cmdSync persists schema/cache migration once for unchanged v${version}/cache${fileCacheVersion}`, async () => {
     await withCommandCodeHome(async ({ filePath, queuePath, sync, readCursors }) => {
