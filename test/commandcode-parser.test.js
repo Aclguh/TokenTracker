@@ -1795,6 +1795,47 @@ test("v2 exact-key compaction keeps missing history and old cost without enqueue
   assert.equal(commandCodeRows(options.projectQueuePath).at(-1).total_cost_usd, 0);
 });
 
+test("Command Code ignores every incomplete tail after usage without decoding message bodies", () => {
+  const secret = "PRIVATE_BODY_WITH_QUOTES_\\\"_AND_BRACKETS_}]}";
+  const complete = messageLine({ id: "torn", message: { content: [{ text: secret }] } });
+  const afterUsage = complete.indexOf(',"model"');
+  assert.ok(afterUsage > 0);
+  const originalParse = JSON.parse;
+  JSON.parse = function (value, ...rest) {
+    assert.ok(!String(value).includes("PRIVATE_BODY"), "body must never be JSON-decoded");
+    return originalParse.call(this, value, ...rest);
+  };
+  try {
+    for (let end = afterUsage; end < complete.length; end++) {
+      assert.equal(extractCommandCodeSessionUsage(complete.slice(0, end)).records.length, 0, `prefix length ${end}`);
+    }
+    assert.equal(extractCommandCodeSessionUsage(`  ${complete}\r\n`).records.length, 1);
+    assert.equal(extractCommandCodeSessionUsage(complete + "garbage").records.length, 0);
+  } finally {
+    JSON.parse = originalParse;
+  }
+});
+
+test("an incomplete zero correction retains history until the record finishes", async (t) => {
+  const { dir, filePath, repoDir, options } = makeLifecycleTree();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  await parseCommandCodeIncremental(options);
+  const hourly = fs.readFileSync(options.queuePath);
+  const project = fs.readFileSync(options.projectQueuePath);
+  const correction = messageLine({ id: "m1", inputTokens: 0, outputTokens: 0, message: { content: "still writing" } });
+  fs.writeFileSync(filePath, `${headerLine("sess-lifecycle", repoDir)}\n${correction.slice(0, -1)}`);
+  roundTripLifecycleCursors(options);
+  await parseCommandCodeIncremental(options);
+  assert.deepEqual(fs.readFileSync(options.queuePath), hourly);
+  assert.deepEqual(fs.readFileSync(options.projectQueuePath), project);
+  fs.appendFileSync(filePath, "}\n");
+  roundTripLifecycleCursors(options);
+  await parseCommandCodeIncremental(options);
+  assert.equal(latestCommandCodeTokens(options.queuePath), 0);
+  assert.equal(commandCodeRows(options.projectQueuePath).at(-1).total_tokens, 0);
+  assert.equal((await parseCommandCodeIncremental(options)).bucketsQueued, 0);
+});
+
 test("standalone zero turns do not create history or force repeated body reads", async (t) => {
   const { dir, filePath, options } = makeLifecycleTree();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -1802,10 +1843,36 @@ test("standalone zero turns do not create history or force repeated body reads",
   await parseCommandCodeIncremental(options);
   assert.equal(latestCommandCodeTokens(options.queuePath), 1100);
   assert.deepEqual(Object.keys(options.cursors.commandCode.messages), [LIFECYCLE_KEY]);
+  const before = JSON.stringify(options.cursors.commandCode);
   roundTripLifecycleCursors(options);
   const repeat = await parseCommandCodeIncremental(options);
   assert.equal(repeat.recordsProcessed, 0);
   assert.equal(repeat.bucketsQueued, 0);
+  assert.equal(JSON.stringify(options.cursors.commandCode), before);
+});
+
+test("cached standalone zero participates when another copy later introduces the same key", async (t) => {
+  const { dir, filePath, repoDir, options } = makeLifecycleTree();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const zeroFile = path.join(dir, "zero.jsonl");
+  fs.writeFileSync(zeroFile, `${headerLine("zero-copy", repoDir)}\n${messageLine({ id: "future", inputTokens: 0, outputTokens: 0 })}\n`);
+  options.sessionFiles = [filePath, zeroFile];
+  await parseCommandCodeIncremental(options);
+  roundTripLifecycleCursors(options);
+  assert.equal((await parseCommandCodeIncremental(options)).recordsProcessed, 0);
+
+  fs.appendFileSync(filePath, messageLine({ id: "future" }) + "\n");
+  roundTripLifecycleCursors(options);
+  await parseCommandCodeIncremental(options);
+  assert.equal(latestCommandCodeTokens(options.queuePath), 1100, "the later zero copy still wins the exact-key conflict");
+  assert.equal(commandCodeRows(options.projectQueuePath).at(-1).total_tokens, 1100);
+
+  fs.unlinkSync(zeroFile);
+  options.sessionFiles = [filePath];
+  roundTripLifecycleCursors(options);
+  await parseCommandCodeIncremental(options);
+  assert.equal(latestCommandCodeTokens(options.queuePath), 2200, "a surviving positive observation can now correct the key");
+  assert.equal((await parseCommandCodeIncremental(options)).bucketsQueued, 0);
 });
 
 test("compact Command Code cursor has no redundant record fields and stays byte-stable", async (t) => {

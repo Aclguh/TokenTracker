@@ -123,32 +123,35 @@ test("cmdSync retains the last Command Code transcript's usage after deletion an
   });
 });
 
-test("cmdSync persists compact schema once even with an unchanged v2 transcript", async () => {
-  await withCommandCodeHome(async ({ filePath, queuePath, sync, readCursors }) => {
-    await sync();
-    const previous = await readCursors();
-    const state = previous.commandCode;
-    state.version = 2;
-    state.fileCacheVersion = 1;
-    state.updatedAt = T0;
-    for (const value of Object.values(state.messages)) {
-      value.filePath = filePath;
-      value.updatedAt = T0;
-      value.conversationCount = 1;
-      value.totals = { ...TOTALS };
-    }
-    await readCursors(previous);
-    const queueBefore = fs.readFileSync(queuePath);
-    const migrated = await sync();
-    assert.equal(migrated.cursor_commits, 1);
-    assert.equal((await readCursors()).commandCode.version, 3);
-    assert.deepEqual(fs.readFileSync(queuePath), queueBefore);
-    const coreBefore = fs.readFileSync(migrated.cursor_path);
-    const repeated = await sync();
-    assert.equal(repeated.cursor_commits, 0);
-    assert.deepEqual(fs.readFileSync(repeated.cursor_path), coreBefore);
+for (const [version, fileCacheVersion] of [[2, 1], [3, 2]]) {
+  test(`cmdSync persists schema/cache migration once for unchanged v${version}/cache${fileCacheVersion}`, async () => {
+    await withCommandCodeHome(async ({ filePath, queuePath, sync, readCursors }) => {
+      await sync();
+      const previous = await readCursors();
+      const state = previous.commandCode;
+      state.version = version;
+      state.fileCacheVersion = fileCacheVersion;
+      state.updatedAt = T0;
+      for (const value of Object.values(state.messages)) {
+        value.filePath = filePath;
+        value.updatedAt = T0;
+        value.conversationCount = 1;
+        value.totals = { ...TOTALS };
+      }
+      await readCursors(previous);
+      const queueBefore = fs.readFileSync(queuePath);
+      const migrated = await sync();
+      assert.equal(migrated.cursor_commits, 1);
+      assert.equal((await readCursors()).commandCode.version, 3);
+      assert.equal((await readCursors()).commandCode.fileCacheVersion, 3);
+      assert.deepEqual(fs.readFileSync(queuePath), queueBefore);
+      const coreBefore = fs.readFileSync(migrated.cursor_path);
+      const repeated = await sync();
+      assert.equal(repeated.cursor_commits, 0);
+      assert.deepEqual(fs.readFileSync(repeated.cursor_path), coreBefore);
+    });
   });
-});
+}
 
 test("Command Code status excludes prompt and checkpoint sidecars from its session count", async () => {
   await withCommandCodeHome(async ({ projectDir, filePath }) => {

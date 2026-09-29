@@ -23584,7 +23584,7 @@ async function parseDshIncremental({ sessionFiles, cursors, queuePath, onProgres
 // non-owning duplicate is re-read rather than storing a second full ledger.
 const COMMAND_CODE_SOURCE = "command-code";
 const COMMAND_CODE_STATE_VERSION = 3;
-const COMMAND_CODE_FILE_CACHE_VERSION = 2;
+const COMMAND_CODE_FILE_CACHE_VERSION = 3;
 const COMMAND_CODE_HEADER_MAX_BYTES = 65536;
 const COMMAND_CODE_HOME_DIR = ".commandcode";
 const COMMAND_CODE_PROJECTS_DIR = "projects";
@@ -23733,6 +23733,31 @@ function commandCodeUsageToTotals(usage) {
   };
 }
 
+// Check record framing without JSON-decoding its body. Finding an early usage
+// field is not proof that an interrupted append completed the enclosing object.
+function isCompleteCommandCodeRecord(raw) {
+  const text = raw.trim();
+  if (text[0] !== "{") return false;
+  const closers = [];
+  let inString = false;
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+    if (inString) {
+      if (char === "\\") index += 1;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === "{") closers.push("}");
+    else if (char === "[") closers.push("]");
+    else if (char === "}" || char === "]") {
+      if (char !== closers.pop()) return false;
+      if (closers.length === 0) return index === text.length - 1;
+    }
+  }
+  return false;
+}
+
 // Extract selected top-level metadata from transcript text scanned locally.
 // findDshJsonProperty slices the needed fields; JSON decoding is limited to
 // selected metadata rather than whole message records or their bodies.
@@ -23741,7 +23766,7 @@ function commandCodeUsageToTotals(usage) {
 // JSON.parse guard checks that body content is not JSON-decoded.
 function extractCommandCodeLine(line) {
   const raw = String(line || "");
-  if (!raw.trim()) return null;
+  if (!isCompleteCommandCodeRecord(raw)) return null;
   const type = parseDshJsonString(findDshJsonProperty(raw, "type"));
   if (type === "session") {
     return {
@@ -23854,10 +23879,13 @@ function normalizeCommandCodeState(raw) {
     }
   }
   const fileIndex = {};
-  if ((raw?.fileCacheVersion === COMMAND_CODE_FILE_CACHE_VERSION || raw?.version === 2 && raw.fileCacheVersion === 1) && raw.fileIndex) {
+  // Older caches omitted uncounted zero identities and accepted torn records.
+  // Re-read them once while retaining the durable ledger above.
+  if (raw?.fileCacheVersion === COMMAND_CODE_FILE_CACHE_VERSION && raw.fileIndex) {
     for (const [key, value] of Object.entries(raw.fileIndex)) {
       if (!files[key] || !Array.isArray(value?.messageKeys) || !Array.isArray(value.headerRanges)) continue;
       if (value.messageKeys.some((entry) => typeof entry !== "string")) continue;
+      if (value.zeroKeys && (!Array.isArray(value.zeroKeys) || value.zeroKeys.some((entry) => typeof entry !== "string"))) continue;
       let end = 0;
       const validRanges = value.headerRanges.every((range) => {
         if (!Number.isSafeInteger(range?.start) || !Number.isSafeInteger(range.length)) return false;
@@ -23869,9 +23897,8 @@ function normalizeCommandCodeState(raw) {
       fileIndex[key] = {
         messageKeys: [...new Set(value.messageKeys)],
         headerRanges: value.headerRanges.map(({ start, length }) => ({ start, length })),
-        completeOwnedSnapshot: raw.version === 2
-          ? value.messageKeys.every((messageKey) => raw.messages?.[messageKey]?.filePath === key)
-          : value.completeOwnedSnapshot === true,
+        completeOwnedSnapshot: value.completeOwnedSnapshot === true,
+        ...(value.zeroKeys?.length ? { zeroKeys: [...new Set(value.zeroKeys)] } : {}),
       };
     }
   }
@@ -23962,7 +23989,8 @@ async function parseCommandCodeIncremental({
   const hourlyState = normalizeHourlyState(structuredClone(cursors?.hourly));
   const state = normalizeCommandCodeState(cursors?.commandCode);
   const schemaMigrated = Boolean(cursors?.commandCode &&
-    cursors.commandCode.version !== COMMAND_CODE_STATE_VERSION);
+    (cursors.commandCode.version !== COMMAND_CODE_STATE_VERSION ||
+      cursors.commandCode.fileCacheVersion !== COMMAND_CODE_FILE_CACHE_VERSION));
   const projectEnabled = typeof projectQueuePath === "string" && projectQueuePath.length > 0;
   const projectState = projectEnabled
     ? normalizeProjectState(structuredClone(cursors?.projectHourly))
@@ -23983,7 +24011,11 @@ async function parseCommandCodeIncremental({
   for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
     const filePath = files[fileIdx];
     const index = state.fileIndex[filePath];
-    const ownsSnapshot = index?.completeOwnedSnapshot && index.messageKeys.every((key) => state.messages[key] && !state.messages[key].legacy);
+    const ownsSnapshot = index?.completeOwnedSnapshot &&
+      index.messageKeys.every((key) => state.messages[key] && !state.messages[key].legacy) &&
+      // A previously uncounted zero can become a correction when another copy
+      // introduces the same identity. Re-read its actual model and counters.
+      !(index.zeroKeys || []).some((key) => state.messages[key] || currentByKey.has(key));
     const snapshot = await readCommandCodeSessionSnapshot(
       filePath,
       ownsSnapshot ? state.files[filePath] : null,
@@ -24098,9 +24130,18 @@ async function parseCommandCodeIncremental({
   }
 
   for (const [filePath, index] of Object.entries(nextFileIndex)) {
-    // New zero-only turns have no ledger contribution to cache or reconcile.
+    // Check ownership before dropping uncounted keys: a positive record that
+    // lost to a zero in another file is still a non-owning snapshot.
+    const ownsAllRecords = index.messageKeys.every((key) => currentOwners.get(key) === filePath);
+    index.completeOwnedSnapshot = ownsAllRecords;
+    // Retain the identities of uncounted zeros without full message metadata.
+    // They need no body reread until a conflicting observation appears.
+    const zeroKeys = [...new Set([
+      ...(index.zeroKeys || []),
+      ...index.messageKeys.filter((key) => !state.messages[key]),
+    ])];
+    if (zeroKeys.length) index.zeroKeys = zeroKeys;
     index.messageKeys = index.messageKeys.filter((key) => state.messages[key]);
-    index.completeOwnedSnapshot = index.messageKeys.every((key) => currentOwners.get(key) === filePath && state.messages[key]);
   }
 
   // Ignore cost-only changes (including old display estimates). The zero
