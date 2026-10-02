@@ -31,6 +31,9 @@ test("macOS production summary single flight makes one HTTP request per date ran
   t.after(() => fs.rmSync(temp, { recursive: true, force: true }));
   const source = `
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 struct UsageSummaryFetchResult: Decodable { let value: Int }
 @MainActor final class APIClient {
     static let shared = APIClient()
